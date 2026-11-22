@@ -1,8 +1,12 @@
 BEND ?= bend
+PYTHON ?= python3
 LIB = $(wildcard src/*.bend)
-TESTS = $(wildcard tests/*.bend)
+TESTS = $(filter-out tests/ipc_interop.bend,$(wildcard tests/*.bend))
 
-.PHONY: all test
+# Keep native compiler memory bounded, including when invoked with -j.
+.NOTPARALLEL:
+
+.PHONY: all test test-interop
 all: build/roundtrip
 
 build:
@@ -13,6 +17,13 @@ build/roundtrip: examples/roundtrip.bend $(LIB) | build
 
 build/test: tests/all.bend $(TESTS) $(LIB) | build
 	$(BEND) $< -o $@
+
+build/ipc-interop: tests/ipc_interop.bend $(LIB) | build
+	$(BEND) $< -o $@
+
+# Optional independent codec verification; requires PyArrow in PYTHON's environment.
+test-interop: build/ipc-interop
+	$(PYTHON) tests/ipc_interop.py ./build/ipc-interop
 
 test: build/roundtrip build/test
 	@set -eu; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; \

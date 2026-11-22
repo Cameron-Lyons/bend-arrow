@@ -113,22 +113,50 @@ def cell(src: Bound, row: List<&2, T.Cell>) -> L.Checked(T.Cell):
     case At{i}: at(row, i)
     case _: L.error(T.Cell, "mixing aggregates and other projections requires GROUP BY")
 
-def project(outputs: List<&2, Output>, +row: List<&2, T.Cell>) -> L.Checked(List<&2, T.Cell>):
-  match outputs:
-    case Nil{}: Done{Nil{}}
-    case Out{src, _} <> rest:
-      do L.Checked<List<&2, T.Cell>>:
-        c : T.Cell <- cell(src, row)
-        r : List<&2, T.Cell> <- project(rest, row)
-        return c <> r
+# Compile row traversal once. Ordered projections visit each skipped cell
+# once; reordered fields restart from the original row as needed.
+type Projection is Data:
+  ProjectAt{forward: Bool, skip: Nat}
+  ProjectValue{cell: T.Cell}
+  ProjectAggregate{}
 
-def project_rows(rows: List<&2, List<&2, T.Cell>>, +outputs: List<&2, Output>, acc: List<&2, List<&2, T.Cell>>) -> L.Checked(List<&2, List<&2, T.Cell>>):
+def projection(outputs: List<&2, Output>, +offset: Nat) -> List<&2, Projection>:
+  match outputs:
+    case Nil{}: Nil{}
+    case Out{At{+index}, _} <> rest:
+      +forward = Nat.is_ge(index, offset)
+      ProjectAt{forward, Bool.pick(Nat, forward, Nat.sub(index, offset), index)} <> projection(rest, index)
+    case Out{Fixed{value}, _} <> rest: ProjectValue{value} <> projection(rest, offset)
+    case _ <> rest: ProjectAggregate{} <> projection(rest, offset)
+
+def project_from(plan: List<&2, Projection>, +row: List<&2, T.Cell>, tail: List<&2, T.Cell>) -> L.Checked(List<&2, T.Cell>):
+  match plan:
+    case Nil{}: Done{Nil{}}
+    case ProjectAt{forward, skip} <> rest:
+      do L.Checked<List<&2, T.Cell>>:
+        +next : List<&2, T.Cell> = List.drop(&2, T.Cell, Bool.pick(List<&2, T.Cell>, forward, tail, row), skip)
+        c : T.Cell <- at(next, 0n)
+        r : List<&2, T.Cell> <- project_from(rest, row, next)
+        return c <> r
+    case ProjectValue{c} <> rest:
+      do L.Checked<List<&2, T.Cell>>:
+        r : List<&2, T.Cell> <- project_from(rest, row, tail)
+        return c <> r
+    case ProjectAggregate{} <> _: L.error(List<&2, T.Cell>, "mixing aggregates and other projections requires GROUP BY")
+
+def project(outputs: List<&2, Output>, +row: List<&2, T.Cell>) -> L.Checked(List<&2, T.Cell>):
+  project_from(projection(outputs, 0n), row, row)
+
+def project_planned(rows: T.Rows, +plan: List<&2, Projection>, acc: T.Rows) -> L.Checked(T.Rows):
   match rows:
     case Nil{}: Done{List.reverse(&2, List<&2, T.Cell>, acc)}
-    case row <> rest:
-      do L.Checked<List<&2, List<&2, T.Cell>>>:
-        r : List<&2, T.Cell> <- project(outputs, row)
-        project_rows(rest, outputs, r <> acc)
+    case +row <> rest:
+      do L.Checked<T.Rows>:
+        r : List<&2, T.Cell> <- project_from(plan, row, row)
+        project_planned(rest, plan, r <> acc)
+
+def project_rows(rows: T.Rows, outputs: List<&2, Output>, acc: T.Rows) -> L.Checked(T.Rows):
+  project_planned(rows, projection(outputs, 0n), acc)
 
 # Accumulate into 128 bits so that an intermediate partial sum can exceed
 # BIGINT and later cancel. Range-check only the final result.

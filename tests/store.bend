@@ -41,6 +41,36 @@ def empty_scan(r: F.Outcome(S.Scan)) -> Bool:
     case Done{S.Scan{0, Nil{}, False{}, _}}: True{}
     case _: False{}
 
+# Exercise every read boundary, including the middle of an escaped marker.
+def split_scan(+prefix: F.Bytes, +suffix: F.Bytes, +wanted: S.Id) -> F.Outcome(S.Scan):
+  do Result<&1, &1, U32 & String, S.Scan>:
+    first : S.Cursor <- S.scan(prefix, initial(), wanted)
+    second : S.Cursor <- S.scan(suffix, first, wanted)
+    S.latest(second)
+
+def check_boundary(prefix: F.Bytes, suffix: F.Bytes, wanted: S.Id) -> IO(Unit):
+  assert(payload(split_scan(prefix, suffix, wanted), 2, 255), "read boundary changed the committed snapshot")
+
+def check_boundaries(suffix: F.Bytes, +reversed: F.Bytes, +wanted: S.Id) -> IO(Unit):
+  match suffix:
+    case Nil{}: check_boundary(List.reverse(&2, U32, reversed), Nil{}, wanted)
+    case +h <> +rest:
+      do IO<Unit>:
+        check_boundary(List.reverse(&2, U32, reversed), h <> rest, wanted)
+        check_boundaries(rest, h <> reversed, wanted)
+
+# Every proper prefix of the next append must leave the prior commit intact;
+# a subsequent complete append must still be able to recover that revision.
+def check_interruptions(suffix: F.Bytes, +reversed: F.Bytes, +first: F.Bytes, +next: F.Bytes, +a: S.Id, +b: S.Id) -> IO(Unit):
+  match suffix:
+    case Nil{}: IO.pure(Unit, Unit{})
+    case h <> rest:
+      +prefix = List.reverse(&2, U32, reversed)
+      do IO<Unit>:
+        assert(payload(inspect(List.append(&2, U32, first, prefix), a), 1, 253), "partial append changed the prior commit")
+        assert(payload(inspect(List.concat(&2, U32, [first, prefix, next]), b), 2, 255), "partial append prevented the next commit")
+        check_interruptions(rest, h <> reversed, first, next, a, b)
+
 def check_scan() -> IO(Unit):
   +a : S.Id = S.Id{10, 20}
   +b : S.Id = S.Id{30, 40}
@@ -51,6 +81,8 @@ def check_scan() -> IO(Unit):
   together = List.concat(&2, U32, [first, incomplete(S.record(1, a, [254])), second, [1, 253, 1, 254]])
   mixed = List.concat(&2, U32, [first, bad_checksum(second), S.record(1, b, [254])])
   do IO<Unit>:
+    check_boundaries(List.append(&2, U32, first, second), Nil{}, b)
+    check_interruptions(second, Nil{}, first, second, a, b)
     assert(payload(inspect(together, b), 2, 255), "orphaned suffix hid the second commit")
     assert(payload(inspect(mixed, b), 2, 254), "damaged frame consumed a revision")
     assert(payload(inspect(List.append(&2, U32, first, incomplete(second)), a), 1, 253), "incomplete record replaced committed data")

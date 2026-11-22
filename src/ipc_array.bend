@@ -123,14 +123,24 @@ def var_cell(text: Bool, valid: Bool, bs: F.Bytes) -> F.R(T.Cell):
         s : String <- UTF8.decode(bs)
         return T.Utf8{s}
 
+# Null slots may span arbitrary bytes. Advance over them without allocating a
+# copied value that will immediately be discarded.
+def value_span(valid: Bool, bs: F.Bytes, n: U32) -> F.R(F.Span):
+  match valid:
+    case True{}: F.split(bs, n)
+    case False{}:
+      do F.R<F.Span>:
+        rest : F.Bytes <- F.drop(bs, n)
+        return F.Split{Nil{}, rest}
+
 def variable(flags: Bools, +text: Bool, +offsets: F.Bytes, +start: U32, bs: F.Bytes, +data_len: U32, acc: Cells) -> F.R(Cells):
   match flags:
     case Nil{}: Done{List.reverse(&2, T.Cell, acc)}
-    case h <> t:
+    case +h <> t:
       do F.R<Cells>:
         +stop : U32 <- F.u32(offsets)
         F.check(U32.is_ge(stop, start) && U32.is_le(stop, data_len), "invalid variable-width offset")
-        +s : F.Span <- F.split(bs, (stop - start : U32))
+        +s : F.Span <- value_span(h, bs, (stop - start : U32))
         value : T.Cell <- var_cell(text, h, F.head(s))
         more : F.Bytes <- F.drop(offsets, 4)
         variable(t, text, more, stop, F.tail(s), data_len, value <> acc)

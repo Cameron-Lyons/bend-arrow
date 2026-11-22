@@ -110,22 +110,69 @@ def slice(rows: Rows(), +kind: A.Physical) -> Result<&1, &1, Error(), Slice>:
         others : Slice <- slice(rest, kind)
         return prepend_cell(others, cell, tail, bytes)
 
-# Each consecutive run of definition levels has a varint header and one byte
-# carrying the repeated one-bit level.
+# Definition levels use RLE for uniform groups and packed bytes for mixed
+# groups. Grouping at eight-value boundaries avoids padding before a later
+# run while keeping alternating nulls to one bit per row.
 def level_run(n: U32, value: U32) -> Bytes():
   join([varint((n << 1n : U32)), [value]])
 
-def levels.go(xs: Bytes(), +last: U32, count: U32) -> Bytes():
-  match xs last:
-    case Nil{} _: level_run(count, last)
-    case 0 <> tail 0: levels.go(tail, 0, (count + 1 : U32))
-    case 1 <> tail 1: levels.go(tail, 1, (count + 1 : U32))
-    case head <> tail _: List.append(&2, U32, level_run(count, last), levels.go(tail, head, 1))
+type LevelRun is Data:
+  NoLevels{}
+  RepeatedLevels{count: U32, value: U32}
+  PackedLevels{groups: U32, reversed: Bytes()}
+
+def level_flush(run: LevelRun, parts: List<&2, Bytes()>) -> List<&2, Bytes()>:
+  match run:
+    case NoLevels{}: parts
+    case RepeatedLevels{n, value}: level_run(n, value) <> parts
+    case PackedLevels{n, bytes}:
+      join([varint(((n << 1n) .|. 1 : U32)), List.reverse(&2, U32, bytes)]) <> parts
+
+type LevelState is Data:
+  LevelState{run: LevelRun, parts: List<&2, Bytes()>}
+
+def level_repeat(count: U32, bits: U32, n: U32, value: U32, parts: List<&2, Bytes()>, same: Bool) -> LevelState:
+  match same:
+    case True{}: LevelState{RepeatedLevels{(n + count : U32), value}, parts}
+    case False{}: LevelState{RepeatedLevels{count, (bits .&. 1 : U32)}, level_flush(RepeatedLevels{n, value}, parts)}
+
+def level_push(count: U32, +bits: U32, state: LevelState, uniform: Bool) -> LevelState:
+  match state uniform:
+    case LevelState{RepeatedLevels{n, +value}, parts} True{}:
+      level_repeat(count, bits, n, value, parts, U32.is_eq(value, (bits .&. 1 : U32)))
+    case LevelState{old, parts} True{}: LevelState{RepeatedLevels{count, (bits .&. 1 : U32)}, level_flush(old, parts)}
+    case LevelState{PackedLevels{n, bytes}, parts} False{}: LevelState{PackedLevels{(n + 1 : U32), bits <> bytes}, parts}
+    case LevelState{old, parts} False{}: LevelState{PackedLevels{1, [bits]}, level_flush(old, parts)}
+
+def level_emit(+count: U32, +bits: U32, state: LevelState) -> LevelState:
+  uniform = U32.is_zero(bits) || U32.is_eq(bits, ((1 << U32.to_nat(count)) - 1 : U32))
+  level_push(count, bits, state, uniform)
+
+def level_ready(bits: U32, state: LevelState, full: Bool) -> LevelState:
+  match full:
+    case True{}: level_emit(8, bits, state)
+    case False{}: state
+
+def level_result(state: LevelState) -> Bytes():
+  LevelState{run, parts} = state
+  join(List.reverse(&2, Bytes(), level_flush(run, parts)))
+
+def level_finish(count: U32, bits: U32, state: LevelState) -> Bytes():
+  match count:
+    case 0: level_result(state)
+    case n: level_result(level_emit(n, bits, state))
+
+def levels.go(xs: Bytes(), +count: U32, bits: U32, state: LevelState) -> Bytes():
+  match xs:
+    case Nil{}: level_finish(count, bits, state)
+    case h <> t:
+      +word = (bits .|. (h << U32.to_nat(count)) : U32)
+      +next = ((count + 1) .&. 7 : U32)
+      +full = U32.is_zero(next)
+      levels.go(t, next, Bool.pick(U32, full, 0, word), level_ready(word, state, full))
 
 def level_bytes(xs: Bytes()) -> Bytes():
-  match xs:
-    case Nil{}: Nil{}
-    case head <> tail: levels.go(tail, head, 1)
+  levels.go(xs, 0, 0, LevelState{NoLevels{}, Nil{}})
 
 def data_page(rows: U32, +payload: Bytes()) -> Bytes():
   +size = number(byte_count(payload, 0))

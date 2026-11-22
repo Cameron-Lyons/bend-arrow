@@ -95,14 +95,22 @@ def bind_operand(input: Operand, cols: List<&2, T.Column>) -> L.Checked(Predicat
     case Group{pred}: Done{pred}
 
 def add_and(prior: Maybe<&2, Predicate>, value: Predicate) -> Predicate:
-  match prior:
-    case None{}: value
-    case Some{p}: Both{p, value}
+  match prior value:
+    case None{} p: p
+    case Some{Always{False{}}} _: Always{False{}}
+    case Some{_} Always{False{}}: Always{False{}}
+    case Some{Always{True{}}} p: p
+    case Some{p} Always{True{}}: p
+    case Some{p} q: Both{p, q}
 
 def add_or(prior: Maybe<&2, Predicate>, value: Predicate) -> Predicate:
-  match prior:
-    case None{}: value
-    case Some{p}: EitherTrue{p, value}
+  match prior value:
+    case None{} p: p
+    case Some{Always{True{}}} _: Always{True{}}
+    case Some{_} Always{True{}}: Always{True{}}
+    case Some{Always{False{}}} p: p
+    case Some{p} Always{False{}}: p
+    case Some{p} q: EitherTrue{p, q}
 
 def finish_terms(terms: Terms, value: Predicate) -> Predicate:
   Terms{ors, ands} = terms
@@ -249,9 +257,15 @@ def filter(rows: List<&2, List<&2, T.Cell>>, +pred: Predicate, +acc: List<&2, Li
         keep : Bool <- test(pred, row)
         filter(rest, pred, Bool.pick(List<&2, List<&2, T.Cell>>, keep, row <> acc, acc))
 
+def filter_bound(pred: Predicate, rows: T.Rows) -> L.Checked(T.Rows):
+  match pred:
+    case Always{True{}}: Done{rows}
+    case Always{False{}}: Done{Nil{}}
+    case p: filter(rows, p, Nil{})
+
 def apply(table: T.Table, tokens: L.Tokens) -> L.Checked(T.Table):
   T.Table{+cols, rows} = table
   do L.Checked<T.Table>:
     p : Predicate <- parse(tokens, cols, Terms{None{}, None{}}, Nil{}, Tokens{Nil{}})
-    valid : List<&2, List<&2, T.Cell>> <- filter(rows, p, Nil{})
+    valid : List<&2, List<&2, T.Cell>> <- filter_bound(p, rows)
     return T.Table{cols, valid}

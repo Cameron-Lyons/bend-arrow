@@ -4,6 +4,7 @@ import ../src/file_bytes.bend as FileBytes
 import ../src/utf8.bend as UTF8
 import ../src/arrow_layout.bend as Layout
 import ../src/ipc_flatbuffer.bend as F
+import ../src/ipc_array.bend as ArrayData
 import ../src/ipc_read.bend as Reader
 import ../src/ipc_write.bend as Writer
 import ../src/parquet_write.bend as ParquetWriter
@@ -114,6 +115,21 @@ def check_zero_columns() -> F.R(Unit):
     result : T.Table <- Reader.decode(bytes)
     F.check(empty_rows(result), "zero-column record batch lost rows")
 
+def null_payload(cells: ArrayData.Cells) -> F.R(Unit):
+  match cells:
+    case T.Null{} <> T.Utf8{"ok"} <> Nil{}: Done{Unit{}}
+    case _: F.fail(Unit, "null variable-width payload changed the following value")
+
+def check_null_payload() -> F.R(Unit):
+  do F.R<Unit>:
+    # A null string may occupy nonempty, invalid UTF-8 bytes. Offsets must
+    # still advance over that payload before decoding the next valid string.
+    cells : ArrayData.Cells <- ArrayData.var_values(True{}, 2, 1,
+      ArrayData.Buffer{[2], 1},
+      ArrayData.Buffer{Writer.chunks([Layout.u32(0), Layout.u32(3), Layout.u32(5)]), 12},
+      ArrayData.Buffer{[255, 255, 255, 111, 107], 5})
+    null_payload(cells)
+
 # PyArrow 26.0.1 wrote the same 14 rows using legacy V4 and modern V5 framing.
 # Both schemas have binary-valued field metadata and a pandas metadata key.
 # The V5 record batch carries its own application metadata.
@@ -194,6 +210,7 @@ def main() -> IO(Unit):
     IO.try(Unit, IO.pure(F.R(Unit), check_keys(dictionaries)))
     IO.try(Unit, IO.pure(F.R(Unit), check_corrupt(bytes)))
     IO.try(Unit, IO.pure(F.R(Unit), check_zero_columns()))
+    IO.try(Unit, IO.pure(F.R(Unit), check_null_payload()))
     IO.try(Unit, IO.pure(F.R(Unit), check_metadata(metadata)))
     IO.try(Unit, IO.pure(F.R(Unit), check_metadata(legacy)))
     IO.try(Unit, IO.pure(F.R(Unit), check_metadata_errors(metadata)))
