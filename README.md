@@ -77,3 +77,7 @@ make test-pyarrow PYTHON=/path/to/venv/bin/python
 ```
 
 The PyArrow test supplies sliced record batches larger than DuckDB's vector size, including a zero-row batch, nullable UTF-8, and nested lists. It checks the values after releasing the result stream and database.
+
+## License
+
+bend-arrow is distributed under the [MIT License](LICENSE). Third-party attributions for Arrow and DuckDB are listed in [licenses/NOTICE](licenses/NOTICE).
