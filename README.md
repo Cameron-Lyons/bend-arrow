@@ -29,11 +29,13 @@ Import `src/duckdb.bend` as `DB` for the connection API and `src/table.bend` as 
 | `DB.memory()` or `DB.open(":memory:")` | Create an isolated in-memory database. |
 | `DB.open(path)` | Open or create a Bend database file. |
 | `DB.query(db, sql)` | Return a `T.Table` of ordered column definitions and typed rows. |
-| `DB.exec(db, sql)` | Execute statements, including `CREATE [TEMP] TABLE`, `INSERT INTO … VALUES`, `BEGIN`, `COMMIT`, and `ROLLBACK`. |
-| `DB.register(db, name, table)` | Add a connection-local temporary table. A name collision returns an error. |
+| `DB.exec(db, sql)` | Execute statements, including `CREATE [TEMP] TABLE`, `INSERT INTO … VALUES`, `INSERT INTO … SELECT`, `DROP TABLE [IF EXISTS]`, `BEGIN`, `COMMIT`, and `ROLLBACK`. |
+| `DB.register(db, name, table)` | Add a connection-local temporary table. A name collision, unsupported column type, or row that disagrees with the schema returns an error. |
 | `DB.close(db)` | Close the session and discard any uncommitted transaction. |
 
-The SELECT evaluator supports column names, aliases, literals, `*`, `COUNT(*)`, and integer `SUM(column)` with a checked signed BIGINT result. Sources include named tables, `(VALUES …) AS t(columns)`, `range(n)`, and `read_parquet('path')`. A WHERE clause can compare a column with a literal or check `IS [NOT] NULL`, with `AND` and `OR`. Group on one input column and order on one output column, optionally with `ASC` or `DESC`. Unsupported SQL syntax returns an error. Identifiers can be double-quoted and strings single-quoted. Double the matching quote to embed one. Explicit column declarations accept `INT`/`INTEGER`, `BIGINT`, `VARCHAR`, and `BOOLEAN`. Use `CREATE TABLE … AS SELECT …` to derive a schema from a query.
+The SELECT evaluator supports column names, aliases, literals, `*`, `COUNT(*)`, `COUNT(column)` for non-null values, and integer `SUM(column)` with a checked signed BIGINT result. Sources include named tables, `(VALUES …) AS t(columns)`, `range(n)`, and `read_parquet('path')`. A WHERE clause can compare a column with a literal or check `IS [NOT] NULL`, with `AND`, `OR`, and parentheses. `AND` binds more tightly than `OR`. Group on one input column and order on one output column, optionally with `ASC` or `DESC`. Unsupported SQL syntax returns an error.
+
+Identifiers can be double-quoted and strings single-quoted. Double the matching quote to embed one. Explicit column declarations accept `INT`/`INTEGER`, `BIGINT`, `VARCHAR`, and `BOOLEAN`. Use `CREATE TABLE … AS SELECT …` to derive a schema from a query. A bare `NULL` result has type `INTEGER` unless a cast or an insert target supplies its type. `INSERT INTO … SELECT` matches columns by position and accepts an `INTEGER` source for a `BIGINT` target.
 
 ```sql
 SELECT region, sum(amount) AS total
@@ -61,9 +63,9 @@ Operations that perform I/O return `IO(Result<…>)`. Use `IO.try` to stop on fa
 
 Both codecs support flat nullable booleans, signed and unsigned integers of 8, 16, 32, and 64 bits, 32- and 64-bit floating point, UTF-8 strings, and binary data. A 64-bit cell stores its high and low 32-bit words. Table constructors also include 128-bit integer cells, which are outside the supported interchange profile.
 
-The Parquet writer emits an uncompressed file with PLAIN data pages (version 1) and RLE definition levels. The reader handles multiple row groups and pages, required and optional fields, PLAIN or dictionary encoding, and uncompressed or Snappy-compressed data. Nested schemas, other compression codecs, and data page version 2 are outside this profile. The Parquet and IPC file APIs materialize their input and accept files smaller than 2 GiB.
+The Parquet writer emits an uncompressed file with PLAIN data pages (version 1) and RLE definition levels. The reader handles multiple row groups and pages, required and optional fields, and both data page versions 1 and 2. It reads PLAIN and dictionary-encoded values, RLE-encoded booleans, and uncompressed or Snappy-compressed pages. Nested schemas and other compression codecs are outside this profile. The Parquet and IPC file APIs materialize their input and accept files smaller than 2 GiB.
 
-Arrow interchange uses the little-endian, uncompressed V5 IPC **stream** format. PyArrow callers can use `pyarrow.ipc.open_stream` and `pyarrow.ipc.new_stream`. The reader combines incoming record batches, including zero-row batches. Nested types, dictionary arrays, custom metadata, IPC file-format containers, and the former in-process C callback interface are outside this API. See the [Arrow IPC specification](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc) and [Parquet format](https://github.com/apache/parquet-format).
+Arrow interchange uses the little-endian, uncompressed V5 IPC **stream** format. PyArrow callers can use `pyarrow.ipc.open_stream` and `pyarrow.ipc.new_stream`. The reader combines incoming record batches, including zero-row batches. It expands dictionary arrays of the supported scalar types into ordinary cells and handles dictionary replacements and deltas. The writer emits plain arrays. Nested types, custom metadata, IPC file-format containers, and the former in-process C callback interface are outside this API. See the [Arrow IPC specification](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc) and [Parquet format](https://github.com/apache/parquet-format).
 
 ## Verification
 

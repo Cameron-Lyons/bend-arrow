@@ -23,21 +23,24 @@ def push(-A: Data, x: A, blocks: Index(A)) -> Index(A):
       merge(A, x, n, l, m, r, tail, U32.is_eq(n, m))
     case rest: Block{1, Tip{x}} <> rest
 
-@unsafe def in_tree(-A: Data, t: Tree<A>, size: U32, i: U32) -> Maybe<&2, A>:
+def choose(-A: Data, first: Bool, left: Unit -> Maybe<&2, A>, right: Unit -> Maybe<&2, A>) -> Maybe<&2, A>:
+  match first:
+    case True{}: left(Unit{})
+    case False{}: right(Unit{})
+
+def in_tree(-A: Data, t: Tree<A>, size: U32, i: U32) -> Maybe<&2, A>:
   match t i:
     case Tip{v} 0: Some{v}
     case Tip{_} _: None{}
     case Branch{v, _, _} 0: Some{v}
     case Branch{_, l, r} +k:
       +half = (size >> 1n : U32)
-      in_tree(A, Bool.pick(Tree<A>, U32.is_le(k, half), l, r), half, ((k - 1) % half : U32))
+      choose(A, U32.is_le(k, half),
+        _ => in_tree(A, l, half, (k - 1 : U32)),
+        _ => in_tree(A, r, half, (k - 1 - half : U32)))
 
-@unsafe def seek(-A: Data, blocks: Index(A), +i: U32) -> Maybe<&2, A>:
+def seek(-A: Data, blocks: Index(A), +i: U32) -> Maybe<&2, A>:
   match blocks:
     case Nil{}: None{}
-    case Block{+n, t} <> tail: seek.block(A, tail, i, n, t, U32.is_lt(i, n))
-
-@unsafe def seek.block(-A: Data, tail: Index(A), i: U32, n: U32, t: Tree<A>, inside: Bool) -> Maybe<&2, A>:
-  match inside:
-    case True{}: in_tree(A, t, n, i)
-    case False{}: seek(A, tail, (i - n : U32))
+    case Block{+n, t} <> tail:
+      choose(A, U32.is_lt(i, n), _ => in_tree(A, t, n, i), _ => seek(A, tail, (i - n : U32)))

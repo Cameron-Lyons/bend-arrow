@@ -3,10 +3,11 @@ import ./table.bend as T
 import ./arrow_layout.bend as A
 import ./ipc_flatbuffer.bend as F
 import ./ipc_array.bend as ArrayData
+import ./ipc_dictionary.bend as D
 import ./utf8.bend as UTF8
 
 type Field is Data:
-  Field{name: String, kind: A.Physical, nullable: Bool}
+  Field{name: String, kind: A.Physical, nullable: Bool, encoding: D.Encoding}
 
 def Fields() -> Data:
   List<&2, Field>
@@ -14,30 +15,10 @@ def Fields() -> Data:
 def Rows() -> Data:
   List<&2, List<&2, T.Cell>>
 
-def integer_name(width: U32, signed: Bool) -> String:
-  match width signed:
-    case 8 True{}: "TINYINT"
-    case 8 False{}: "UTINYINT"
-    case 16 True{}: "SMALLINT"
-    case 16 False{}: "USMALLINT"
-    case 32 True{}: "INTEGER"
-    case 32 False{}: "UINTEGER"
-    case 64 True{}: "BIGINT"
-    case _ _: "UBIGINT"
-
-def sql_type(kind: A.Physical) -> String:
-  match kind:
-    case A.Integer{w, s}: integer_name(w, s)
-    case A.Real{32}: "FLOAT"
-    case A.Real{_}: "DOUBLE"
-    case A.Utf8Type{}: "VARCHAR"
-    case A.Binary{}: "BLOB"
-    case A.Bit{}: "BOOLEAN"
-
 def columns(fields: Fields) -> List<&2, T.Column>:
   match fields:
     case Nil{}: Nil{}
-    case Field{name, k, _} <> t: T.Column{name, sql_type(k)} <> columns(t)
+    case Field{name, k, _, _} <> t: T.Column{name, A.sql_type(k)} <> columns(t)
 
 def physical(tag: U32, +o: F.Object) -> F.R(A.Physical):
   match tag:
@@ -58,11 +39,34 @@ def physical(tag: U32, +o: F.Object) -> F.R(A.Physical):
     case 6: Done{A.Bit{}}
     case _: F.fail(A.Physical, "unsupported field type")
 
+def index_type(+r: F.Region, pos: U32) -> F.R(A.Physical):
+  match pos:
+    case 0: Done{A.Integer{32, True{}}}
+    case p:
+      do F.R<A.Physical>:
+        target : U32 <- F.indirect(r, p)
+        obj : F.Object <- F.object(r, target)
+        physical(2, obj)
+
+def encoding(+r: F.Region, pos: U32) -> F.R(D.Encoding):
+  match pos:
+    case 0: Done{D.Plain{}}
+    case p:
+      do F.R<D.Encoding>:
+        target : U32 <- F.indirect(r, p)
+        +obj : F.Object <- F.object(r, target)
+        id : String <- D.id(obj)
+        tag : U32 <- F.scalar(obj, 3, 2)
+        F.check(U32.is_zero(tag), "unsupported dictionary kind")
+        idx : U32 <- F.slot(obj, 1, 4)
+        ty : A.Physical <- index_type(r, idx)
+        return D.Encoded{id, ty}
+
 def field(+r: F.Region, target: U32) -> F.R(Field):
   do F.R<Field>:
     +o : F.Object <- F.object(r, target)
     dict : U32 <- F.slot(o, 4, 4)
-    F.check(U32.is_zero(dict), "dictionary encoding is unsupported")
+    enc : D.Encoding <- encoding(r, dict)
     F.no_vector(o, 5, 4, "nested fields are unsupported")
     F.no_vector(o, 6, 4, "custom field metadata is unsupported")
     name_pos : U32 <- F.ref(o, 0)
@@ -74,7 +78,7 @@ def field(+r: F.Region, target: U32) -> F.R(Field):
     spec : U32 <- F.ref(o, 3)
     ty : F.Object <- F.object(r, spec)
     kind : A.Physical <- physical(tag, ty)
-    return Field{name, kind, U32.is_ne(nullable, 0)}
+    return Field{name, kind, U32.is_ne(nullable, 0), enc}
 
 @unsafe def read_fields(+r: F.Region, +pos: U32, n: U32, acc: Fields) -> F.R(Fields):
   match n:
@@ -89,12 +93,30 @@ def schema_fields(r: F.Region, vec: F.Vector) -> F.R(Fields):
   F.Vector{start, count} = vec
   read_fields(r, start, count, Nil{})
 
+@unsafe def check_features(+r: F.Region, +pos: U32, n: U32) -> F.R(Unit):
+  match n:
+    case 0: Done{Unit{}}
+    case k:
+      do F.R<Unit>:
+        feature : U32 <- F.at(r, pos, 8)
+        F.check(U32.is_le(feature, 1), "schema requests unsupported features")
+        check_features(r, (pos + 8 : U32), (k - 1 : U32))
+
+def feature_vector(r: F.Region, v: F.Vector) -> F.R(Unit):
+  F.Vector{pos, n} = v
+  check_features(r, pos, n)
+
+def features(+o: F.Object) -> F.R(Unit):
+  do F.R<Unit>:
+    v : F.Vector <- F.vector(o, 3, 8)
+    feature_vector(F.data(o), v)
+
 def schema(+o: F.Object) -> F.R(Fields):
   do F.R<Fields>:
     endian : U32 <- F.scalar(o, 0, 2)
     F.check(U32.is_zero(endian), "only little-endian schemas are supported")
     F.no_vector(o, 2, 4, "custom schema metadata is unsupported")
-    F.no_vector(o, 3, 8, "schema requests unsupported features")
+    features(o)
     fields : F.Vector <- F.vector(o, 1, 4)
     schema_fields(F.data(o), fields)
 
@@ -118,10 +140,9 @@ def Pairs() -> Data:
         pairs.go(rest, (k - 1 : U32), Pair64{a, b} <> acc)
 
 def pairs(r: F.Region, v: F.Vector) -> F.R(Pairs):
-  F.Region{bs, _} = r
   F.Vector{pos, n} = v
   do F.R<Pairs>:
-    bytes : F.Bytes <- F.drop(bs, pos)
+    bytes : F.Bytes <- F.suffix(r, pos)
     pairs.go(bytes, n, Nil{})
 
 def Buffers() -> Data:
@@ -175,34 +196,47 @@ def get_rest(c: ColumnData) -> Buffers:
   ColumnData{_, rest} = c
   rest
 
-def rows(fields: Fields, nodes: Pairs, bufs: Buffers, +n: U32) -> F.R(Rows):
+def read_field(enc: D.Encoding, kind: A.Physical, n: U32, nulls: U32, bufs: Buffers, reg: D.Registry) -> F.R(ColumnData):
+  match enc:
+    case D.Plain{}: read_column(kind, n, nulls, bufs)
+    case D.Encoded{id, idx}:
+      do F.R<ColumnData>:
+        dict : D.Dictionary <- D.require(D.lookup(reg, id))
+        +c : ColumnData <- read_column(idx, n, nulls, bufs)
+        values : ArrayData.Cells <- D.expand(dict, get_cells(c))
+        return ColumnData{values, get_rest(c)}
+
+def rows(fields: Fields, nodes: Pairs, bufs: Buffers, +n: U32, +reg: D.Registry) -> F.R(Rows):
   match fields nodes:
     case Nil{} Nil{}:
       do F.R<Rows>:
         F.check(List.is_empty(&2, F.Bytes, bufs), "extra record batch buffers")
         return Nil{}
-    case Field{_, k, nullable} <> rest Pair64{length, +nulls} <> trailing:
+    case Field{_, k, nullable, enc} <> rest Pair64{length, +nulls} <> trailing:
       do F.R<Rows>:
         F.check(U32.is_eq(length, n) && U32.is_le(nulls, n), "inconsistent field node")
         F.check(nullable || U32.is_zero(nulls), "null in a required field")
-        +c : ColumnData <- read_column(k, n, nulls, bufs)
-        more : Rows <- rows(rest, trailing, get_rest(c), n)
+        +c : ColumnData <- read_field(enc, k, n, nulls, bufs, reg)
+        more : Rows <- rows(rest, trailing, get_rest(c), n, reg)
         return prepend(get_cells(c), more)
     case _ _: F.fail(Rows, "field node count differs from schema")
 
 # A zero-column batch can advertise any row count in a few metadata bytes.
 # Bound that expansion while preserving empty rows from ordinary streams.
-def batch_rows(fields: Fields, nodes: Pairs, bs: Buffers, +n: U32) -> F.R(Rows):
+def batch_rows(fields: Fields, nodes: Pairs, bs: Buffers, +n: U32, reg: D.Registry) -> F.R(Rows):
   match fields:
     case Nil{}:
       do F.R<Rows>:
         F.check(List.is_empty(&2, Pair64, nodes) && List.is_empty(&2, F.Bytes, bs), "unexpected data for zero-column batch")
         F.check(U32.is_le(n, 1048576), "zero-column batch exceeds empty-row materialization limit")
         return List.replicate(List<&2, T.Cell>, U32.to_nat(n), Nil{})
-    case _: rows(fields, nodes, bs, n)
+    case _: rows(fields, nodes, bs, n, reg)
 
-def batch(+o: F.Object, +fields: Fields, body: F.Bytes) -> F.R(Rows):
-  do F.R<Rows>:
+type Batch is Data:
+  Batch{n: U32, nodes: Pairs, buffers: Buffers}
+
+def batch(+o: F.Object, body: F.Bytes) -> F.R(Batch):
+  do F.R<Batch>:
     +n : U32 <- F.scalar(o, 0, 8)
     F.check(U32.is_le(n, 2147483647), "row count exceeds supported range")
     comp : U32 <- F.slot(o, 3, 4)
@@ -213,7 +247,7 @@ def batch(+o: F.Object, +fields: Fields, body: F.Bytes) -> F.R(Rows):
     ns : Pairs <- pairs(F.data(o), nodes)
     offsets : Pairs <- pairs(F.data(o), refs)
     bs : Buffers <- buffers(offsets, body, 0)
-    batch_rows(fields, ns, bs, n)
+    return Batch{n, ns, bs}
 
 type Frame is Data:
   End{}
@@ -264,16 +298,58 @@ def next(+bs: F.Bytes) -> F.R(Frame):
         rest : F.Bytes <- F.drop(bs, 4)
         prefix(rest, first)
 
-@unsafe def batches(f: Frame, +fields: Fields) -> F.R(Rows):
+def declarations(fields: Fields, +reg: D.Registry) -> F.R(D.Registry):
+  match fields:
+    case Nil{}: Done{reg}
+    case Field{_, k, _, D.Encoded{+id, _}} <> t:
+      do F.R<D.Registry>:
+        next : D.Registry <- D.declare(reg, id, k, D.lookup(reg, id))
+        declarations(t, next)
+    case _ <> t: declarations(t, reg)
+
+def dictionary_cells(b: Batch, kind: A.Physical) -> F.R(ArrayData.Cells):
+  match b:
+    case Batch{+n, Pair64{len, +nulls} <> Nil{}, bs}:
+      do F.R<ArrayData.Cells>:
+        F.check(U32.is_eq(n, len) && U32.is_le(nulls, n), "inconsistent dictionary field node")
+        +c : ColumnData <- read_column(kind, n, nulls, bs)
+        F.check(List.is_empty(&2, F.Bytes, get_rest(c)), "extra dictionary buffers")
+        return get_cells(c)
+    case _: F.fail(ArrayData.Cells, "expected one dictionary field node")
+
+def dictionary(+o: F.Object, body: F.Bytes, +reg: D.Registry) -> F.R(D.Registry):
+  do F.R<D.Registry>:
+    +id : String <- D.id(o)
+    +dict : D.Dictionary <- D.require(D.lookup(reg, id))
+    +delta : U32 <- F.scalar(o, 2, 1)
+    F.check(U32.is_le(delta, 1), "invalid dictionary delta flag")
+    base : D.Values <- D.base(dict, U32.is_ne(delta, 0))
+    pos : U32 <- F.ref(o, 1)
+    header : F.Object <- F.object(F.data(o), pos)
+    b : Batch <- batch(header, body)
+    +kind : A.Physical = D.kind(dict)
+    cells : ArrayData.Cells <- dictionary_cells(b, kind)
+    return Map.set(&2, Maybe<&2, D.Dictionary>, reg, id, Some{D.Dictionary{kind, Some{D.extend(cells, base)}}})
+
+def materialize(b: Batch, fields: Fields, reg: D.Registry) -> F.R(Rows):
+  Batch{n, ns, bs} = b
+  batch_rows(fields, ns, bs, n, reg)
+
+@unsafe def batches(f: Frame, +fields: Fields, +reg: D.Registry, acc: Rows) -> F.R(Rows):
   match f:
-    case End{}: Done{Nil{}}
+    case End{}: Done{List.reverse(&2, List<&2, T.Cell>, acc)}
+    case Frame{2, header, body, rest}:
+      do F.R<Rows>:
+        updated : D.Registry <- dictionary(header, body, reg)
+        frame : Frame <- next(rest)
+        batches(frame, fields, updated, acc)
     case Frame{3, header, body, rest}:
       do F.R<Rows>:
-        data : Rows <- batch(header, fields, body)
+        b : Batch <- batch(header, body)
+        data : Rows <- materialize(b, fields, reg)
         frame : Frame <- next(rest)
-        more : Rows <- batches(frame, fields)
-        return List.append(&2, List<&2, T.Cell>, data, more)
-    case _: F.fail(Rows, "expected record batch or end of stream")
+        batches(frame, fields, reg, List.reverse.go(&2, List<&2, T.Cell>, data, acc))
+    case _: F.fail(Rows, "expected dictionary, record batch or end of stream")
 
 def first(f: Frame) -> F.R(T.Table):
   match f:
@@ -281,7 +357,8 @@ def first(f: Frame) -> F.R(T.Table):
       do F.R<T.Table>:
         +fields : Fields <- schema(header)
         frame : Frame <- next(rest)
-        data : Rows <- batches(frame, fields)
+        reg : D.Registry <- declarations(fields, MTip{})
+        data : Rows <- batches(frame, fields, reg, Nil{})
         return T.Table{columns(fields), data}
     case _: F.fail(T.Table, "expected initial schema message")
 

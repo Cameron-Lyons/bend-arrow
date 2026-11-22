@@ -30,21 +30,31 @@ def keywords() -> List<&2, String>:
    "WHERE", "AS", "VALUES", "IS", "NOT", "NULL", "OR", "AND",
    "TRUE", "FALSE"]
 
-def keyword(+upper: String, original: String) -> Token:
-  reserved = List.contains(~String, ~String.eq, keywords, upper)
-  Bool.pick(Token, reserved, Keyword{upper}, Name{original})
+# DROP, IF and EXISTS are keywords only in this statement. Existing unquoted
+# column and table names keep working, and quoted words stay identifiers.
+def contextual(+word: String, acc: Tokens) -> Bool:
+  match acc:
+    case Nil{}: String.eq(word, "DROP")
+    case Symbol{59} <> _: String.eq(word, "DROP")
+    case Keyword{+last} <> Keyword{+previous} <> _:
+      (String.eq(word, "IF") && String.eq(last, "TABLE") && String.eq(previous, "DROP")) || (String.eq(word, "EXISTS") && String.eq(last, "IF") && String.eq(previous, "TABLE"))
+    case _: False{}
 
-def word(+value: String, digit: Bool) -> Token:
+def keyword(+upper: String, original: String, +acc: Tokens) -> Tokens:
+  reserved = List.contains(~String, ~String.eq, keywords, upper) || contextual(upper, acc)
+  Bool.pick(Token, reserved, Keyword{upper}, Name{original}) <> acc
+
+def word(+value: String, digit: Bool, acc: Tokens) -> Tokens:
   match digit:
-    case True{}: Number{value}
-    case False{}: keyword(String.to_upper(value), value)
+    case True{}: Number{value} <> acc
+    case False{}: keyword(String.to_upper(value), value, acc)
 
 def flush(reversed: String, acc: Tokens) -> Tokens:
   match reversed:
     case SNil{}: acc
     case SCon{h, t}:
       +value = String.reverse(SCon{h, t})
-      word(value, Char.is_digit(Maybe.default(&2, Char, String.get(value, 0n), Chr{32}))) <> acc
+      word(value, Char.is_digit(Maybe.default(&2, Char, String.get(value, 0n), Chr{32})), acc)
 
 type LexState is Data:
   Bare{word: String, acc: Tokens}

@@ -1,5 +1,6 @@
 import Base
 import ./arrow_layout.bend as A
+import ./byte_index.bend as B
 
 def Bytes() -> Data:
   A.Bytes
@@ -60,32 +61,39 @@ def word(bs: Bytes, size: U32) -> R(U32):
     case a <> b <> c <> d <> 0 <> 0 <> 0 <> 0 <> _ 8: Done{(a .|. (b << 8n) .|. (c << 16n) .|. (d << 24n) : U32)}
     case _ _: fail(U32, "truncated or oversized integer")
 
-type Region is Data:
-  Region{bytes: Bytes, size: U32}
+# FlatBuffers contain random-access offsets. Index metadata once so looking up
+# each field of a wide schema does not rescan all preceding fields.
+def Region() -> Data:
+  B.Index
 
-def region(+bs: Bytes) -> Region:
-  Region{bs, A.length(U32, bs)}
+def region(bs: Bytes) -> Region:
+  B.build(bs)
 
 def size(r: Region) -> U32:
-  Region{_, n} = r
-  n
+  B.size(r)
 
 def fits(+length: U32, +pos: U32, n: U32) -> Bool:
   U32.is_le(pos, length) && U32.is_le(n, (length - pos : U32))
 
-def span(r: Region, +pos: U32, +n: U32) -> R(Bytes):
-  Region{bs, len} = r
+def suffix_at(found: Maybe<&2, Bytes>) -> R(Bytes):
+  match found:
+    case Some{bs}: Done{bs}
+    case None{}: fail(Bytes, "offset outside metadata")
+
+def suffix(r: Region, pos: U32) -> R(Bytes):
+  suffix_at(B.suffix(r, pos))
+
+def span(+r: Region, +pos: U32, +n: U32) -> R(Bytes):
   do R<Bytes>:
-    check(fits(len, pos, n), "span outside buffer")
-    rest : Bytes <- drop(bs, pos)
+    check(fits(size(r), pos, n), "span outside buffer")
+    rest : Bytes <- suffix(r, pos)
     part : Span <- split(rest, n)
     return head(part)
 
-def at(r: Region, +pos: U32, +n: U32) -> R(U32):
-  Region{bs, len} = r
+def at(+r: Region, +pos: U32, +n: U32) -> R(U32):
   do R<U32>:
-    check(fits(len, pos, n), "scalar outside metadata")
-    rest : Bytes <- drop(bs, pos)
+    check(fits(size(r), pos, n), "scalar outside metadata")
+    rest : Bytes <- suffix(r, pos)
     word(rest, n)
 
 def indirect(+r: Region, +pos: U32) -> R(U32):

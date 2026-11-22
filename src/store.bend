@@ -96,21 +96,6 @@ type Frame is Data:
 type Cursor is Data:
   Cursor{frame: Frame, snapshot: Scan}
 
-def in_frame(byte: U32, acc: F.Bytes, prior: Scan, wanted: Id) -> F.Outcome(Cursor):
-  match byte:
-    case 253: Done{Cursor{Escaped{acc}, prior}}
-    case 254: Done{Cursor{Between{}, accept(List.reverse(&2, U32, acc), prior, wanted)}}
-    case x: Done{Cursor{InFrame{x <> acc}, prior}}
-
-def advance(+byte: U32, frame: Frame, prior: Scan, wanted: Id) -> F.Outcome(Cursor):
-  match frame:
-    case Start{}: Fail{(22, "unrecognized database file")}
-    case Between{}: Done{Cursor{Between{}, prior}}
-    case Escaped{acc}:
-      next = Bool.pick(Frame, U32.is_le(byte, 2), InFrame{(253 + byte : U32) <> acc}, Between{})
-      Done{Cursor{next, prior}}
-    case InFrame{acc}: in_frame(byte, acc, prior, wanted)
-
 def has_magic(bytes: F.Bytes) -> Bool:
   match bytes:
     case 66 <> 68 <> 66 <> 49 <> _: True{}
@@ -125,23 +110,25 @@ def abandoned(frame: Frame, +prior: Scan) -> Scan:
     case Escaped{acc} _: Bool.pick(Scan, has_magic(List.reverse(&2, U32, acc)), identified(prior), prior)
     case _ _: prior
 
-def on_byte(byte: U32, frame: Frame, prior: Scan, wanted: Id) -> F.Outcome(Cursor):
-  match byte:
-    case 255: Done{Cursor{InFrame{Nil{}}, abandoned(frame, prior)}}
-    case x: advance(x, frame, prior, wanted)
+# Carry the frame and snapshot through each chunk. Allocate a cursor only
+# when handing the scan back to the file reader.
+def scan_bytes(bytes: F.Bytes, frame: Frame, prior: Scan, +wanted: Id) -> F.Outcome(Cursor):
+  match bytes frame:
+    case Nil{} f: Done{Cursor{f, prior}}
+    case 255 <> t f: scan_bytes(t, InFrame{Nil{}}, abandoned(f, prior), wanted)
+    case _ Start{}: Fail{(22, "unrecognized database file")}
+    case _ <> t Between{}: scan_bytes(t, Between{}, prior, wanted)
+    case +h <> t Escaped{acc}:
+      next = Bool.pick(Frame, U32.is_le(h, 2), InFrame{(253 + h : U32) <> acc}, Between{})
+      scan_bytes(t, next, prior, wanted)
+    case 253 <> t InFrame{acc}: scan_bytes(t, Escaped{acc}, prior, wanted)
+    case 254 <> t InFrame{acc}:
+      scan_bytes(t, Between{}, accept(List.reverse(&2, U32, acc), prior, wanted), wanted)
+    case h <> t InFrame{acc}: scan_bytes(t, InFrame{h <> acc}, prior, wanted)
 
-def consume(byte: U32, cursor: Cursor, wanted: Id) -> F.Outcome(Cursor):
-  match cursor:
-    case Cursor{frame, prior}:
-      on_byte(byte, frame, prior, wanted)
-
-def scan(bytes: F.Bytes, cursor: Cursor, +wanted: Id) -> F.Outcome(Cursor):
-  match bytes:
-    case Nil{}: Done{cursor}
-    case h <> t:
-      do Result<&1, &1, U32 & String, Cursor>:
-        next : Cursor <- consume(h, cursor, wanted)
-        scan(t, next, wanted)
+def scan(bytes: F.Bytes, cursor: Cursor, wanted: Id) -> F.Outcome(Cursor):
+  Cursor{frame, prior} = cursor
+  scan_bytes(bytes, frame, prior, wanted)
 
 def escape(bytes: F.Bytes) -> F.Bytes:
   match bytes:

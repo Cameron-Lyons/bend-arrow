@@ -1,5 +1,6 @@
 import Base
 import ./table.bend as T
+import ./table_validate.bend as Validate
 import ./sql.bend as SQL
 import ./sql_lexer.bend as Lexer
 import ./catalog.bend as C
@@ -231,8 +232,14 @@ def execute_parsed(r: F.Outcome(Lexer.Tokens), s: Session) -> IO(Step):
 def execute(sql: String, +s: Session) -> IO(Step):
   execute_parsed(Lexer.tokenize(sql), s)
 
+def imported_table(name: String, +table: T.Table, c: C.Catalog) -> F.Outcome(C.Catalog):
+  do Result<&1, &1, U32 & String, C.Catalog>:
+    next : C.Catalog <- C.add(c, name, table, True{})
+    _ : Unit <- Validate.check(table)
+    return next
+
 def imported(name: String, table: T.Table, +s: Session) -> IO(Step):
-  edited(s, C.modified(C.add(catalog(s), name, table, True{}), False{}))
+  edited(s, C.modified(imported_table(name, table, catalog(s)), False{}))
 
 def on_refresh(r: F.Outcome(Session), original: Session, action: Session -> IO(Step)) -> IO(Step):
   match r:

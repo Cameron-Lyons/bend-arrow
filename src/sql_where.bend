@@ -27,7 +27,8 @@ def null_test(ref: E.ColumnRef, invert: Bool) -> Predicate:
 def comparison(ref: E.ColumnRef, op: Comparison, lit: P.Literal) -> L.Checked(Predicate):
   E.Ref{index, _, +kind} = ref
   P.Lit{value, +other, _} = lit
-  compatible = ((V.integer_kind(kind) || P.unsigned_kind(kind)) && V.integer_kind(other)) || String.eq(kind, other) || String.eq(other, "NULL")
+  integer = (V.integer_kind(kind) || P.unsigned_kind(kind)) && V.integer_kind(other)
+  compatible = integer || (P.unsigned_kind(kind) && P.unsigned_kind(other)) || String.eq(kind, other) || String.eq(other, "NULL")
   P.expect(Predicate, compatible, Compare{index, op, value}, "comparison type differs from column")
 
 def constant_expr(e: P.Expr) -> L.Checked(P.Literal):
@@ -50,9 +51,10 @@ def positive(tokens: L.Tokens) -> Bool:
 
 def operand(ref: E.ColumnRef, op: Comparison, +tokens: L.Tokens) -> L.Checked(Predicate):
   E.Ref{index, name, +kind} = ref
-  convert = String.eq(kind, "FLOAT") || String.eq(kind, "DOUBLE") || (P.unsigned_kind(kind) && positive(tokens))
+  +wide = P.unsigned_kind(kind) && positive(tokens)
+  convert = String.eq(kind, "FLOAT") || String.eq(kind, "DOUBLE") || wide
   do L.Checked<Predicate>:
-    lit : P.Literal <- typed_operand(kind, tokens, convert)
+    lit : P.Literal <- typed_operand(Bool.pick(String, wide, "UBIGINT", kind), tokens, convert)
     comparison(E.Ref{index, name, kind}, op, lit)
 
 def operator(tokens: L.Tokens, ref: E.ColumnRef) -> L.Checked(Predicate):
@@ -78,35 +80,73 @@ def atom(tokens: L.Tokens, cols: List<&2, T.Column>) -> L.Checked(Predicate):
         operator(rest, ref)
     case _: L.error(Predicate, "expected a WHERE condition")
 
-def parts(tokens: L.Tokens, +keyword: String, +current: L.Tokens, +acc: List<&2, L.Tokens>) -> List<&2, L.Tokens>:
+# Each nesting level holds the completed OR terms and the current AND term.
+# Bind every atom before evaluation, including on empty input.
+type Terms is Data:
+  Terms{disjunction: Maybe<&2, Predicate>, conjunction: Maybe<&2, Predicate>}
+
+type Operand is Data:
+  Tokens{reversed: L.Tokens}
+  Group{value: Predicate}
+
+def bind_operand(input: Operand, cols: List<&2, T.Column>) -> L.Checked(Predicate):
+  match input:
+    case Tokens{ts}: atom(List.reverse(&2, L.Token, ts), cols)
+    case Group{pred}: Done{pred}
+
+def add_and(prior: Maybe<&2, Predicate>, value: Predicate) -> Predicate:
+  match prior:
+    case None{}: value
+    case Some{p}: Both{p, value}
+
+def add_or(prior: Maybe<&2, Predicate>, value: Predicate) -> Predicate:
+  match prior:
+    case None{}: value
+    case Some{p}: EitherTrue{p, value}
+
+def finish_terms(terms: Terms, value: Predicate) -> Predicate:
+  Terms{ors, ands} = terms
+  add_or(ors, add_and(ands, value))
+
+def join_terms(conjunction: Bool, terms: Terms, value: Predicate) -> Terms:
+  match conjunction:
+    case False{}: Terms{Some{finish_terms(terms, value)}, None{}}
+    case True{}:
+      Terms{ors, ands} = terms
+      Terms{ors, Some{add_and(ands, value)}}
+
+def parse(tokens: L.Tokens, +cols: List<&2, T.Column>, terms: Terms, stack: List<&2, Terms>, input: Operand) -> L.Checked(Predicate):
   match tokens:
-    case Nil{}: List.reverse(&2, L.Tokens, List.reverse(&2, L.Token, current) <> acc)
-    case L.Keyword{+k} <> t:
-      +split = String.eq(k, keyword)
-      head = Bool.pick(L.Tokens, split, Nil{}, L.Keyword{k} <> current)
-      groups = Bool.pick(List<&2, L.Tokens>, split, List.reverse(&2, L.Token, current) <> acc, acc)
-      parts(t, keyword, head, groups)
-    case h <> t: parts(t, keyword, h <> current, acc)
-
-def conjunction(groups: List<&2, L.Tokens>, +cols: List<&2, T.Column>) -> L.Checked(Predicate):
-  match groups:
-    case Nil{}: Done{Always{True{}}}
-    case h <> Nil{}: atom(h, cols)
-    case h <> t:
+    case Nil{}:
+      match stack:
+        case Nil{}:
+          do L.Checked<Predicate>:
+            p : Predicate <- bind_operand(input, cols)
+            return finish_terms(terms, p)
+        case _: L.error(Predicate, "unclosed '(' in WHERE")
+    case L.Symbol{40} <> tail:
+      match input:
+        case Tokens{Nil{}}: parse(tail, cols, Terms{None{}, None{}}, terms <> stack, Tokens{Nil{}})
+        case _: L.error(Predicate, "unexpected '(' in WHERE")
+    case L.Symbol{41} <> tail:
+      match stack:
+        case Nil{}: L.error(Predicate, "unexpected ')' in WHERE")
+        case outer <> rest:
+          do L.Checked<Predicate>:
+            p : Predicate <- bind_operand(input, cols)
+            parse(tail, cols, outer, rest, Group{finish_terms(terms, p)})
+    case L.Keyword{"AND"} <> tail:
       do L.Checked<Predicate>:
-        x : Predicate <- atom(h, cols)
-        y : Predicate <- conjunction(t, cols)
-        return Both{x, y}
-
-def disjunction(groups: List<&2, L.Tokens>, +cols: List<&2, T.Column>) -> L.Checked(Predicate):
-  match groups:
-    case Nil{}: Done{Always{False{}}}
-    case h <> Nil{}: conjunction(parts(h, "AND", Nil{}, Nil{}), cols)
-    case h <> t:
+        p : Predicate <- bind_operand(input, cols)
+        parse(tail, cols, join_terms(True{}, terms, p), stack, Tokens{Nil{}})
+    case L.Keyword{"OR"} <> tail:
       do L.Checked<Predicate>:
-        x : Predicate <- conjunction(parts(h, "AND", Nil{}, Nil{}), cols)
-        y : Predicate <- disjunction(t, cols)
-        return EitherTrue{x, y}
+        p : Predicate <- bind_operand(input, cols)
+        parse(tail, cols, join_terms(False{}, terms, p), stack, Tokens{Nil{}})
+    case token <> tail:
+      match input:
+        case Tokens{ts}: parse(tail, cols, terms, stack, Tokens{token <> ts})
+        case Group{_}: L.error(Predicate, "expected AND or OR after WHERE group")
 
 def relation(c: Cmp, op: Comparison) -> Bool:
   match c op:
@@ -171,6 +211,16 @@ def is_null(cell: T.Cell) -> Bool:
     case T.Null{}: True{}
     case _: False{}
 
+def and_next(first: Bool, next: Unit -> L.Checked(Bool)) -> L.Checked(Bool):
+  match first:
+    case True{}: next(Unit{})
+    case False{}: Done{False{}}
+
+def or_next(first: Bool, next: Unit -> L.Checked(Bool)) -> L.Checked(Bool):
+  match first:
+    case True{}: Done{True{}}
+    case False{}: next(Unit{})
+
 def test(pred: Predicate, +row: List<&2, T.Cell>) -> L.Checked(Bool):
   match pred:
     case Always{b}: Done{b}
@@ -185,13 +235,11 @@ def test(pred: Predicate, +row: List<&2, T.Cell>) -> L.Checked(Bool):
     case Both{x, y}:
       do L.Checked<Bool>:
         a : Bool <- test(x, row)
-        b : Bool <- test(y, row)
-        return a && b
+        and_next(a, _ => test(y, row))
     case EitherTrue{x, y}:
       do L.Checked<Bool>:
         a : Bool <- test(x, row)
-        b : Bool <- test(y, row)
-        return a || b
+        or_next(a, _ => test(y, row))
 
 def filter(rows: List<&2, List<&2, T.Cell>>, +pred: Predicate, +acc: List<&2, List<&2, T.Cell>>) -> L.Checked(List<&2, List<&2, T.Cell>>):
   match rows:
@@ -204,6 +252,6 @@ def filter(rows: List<&2, List<&2, T.Cell>>, +pred: Predicate, +acc: List<&2, Li
 def apply(table: T.Table, tokens: L.Tokens) -> L.Checked(T.Table):
   T.Table{+cols, rows} = table
   do L.Checked<T.Table>:
-    p : Predicate <- disjunction(parts(tokens, "OR", Nil{}, Nil{}), cols)
+    p : Predicate <- parse(tokens, cols, Terms{None{}, None{}}, Nil{}, Tokens{Nil{}})
     valid : List<&2, List<&2, T.Cell>> <- filter(rows, p, Nil{})
     return T.Table{cols, valid}

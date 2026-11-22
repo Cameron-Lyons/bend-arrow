@@ -1,6 +1,6 @@
 import Base
 import ./parquet_wire.bend as W
-import ./parquet_index.bend as Index
+import ./random_access_list.bend as Index
 
 type Output is Data:
   Out{size: U32, index: Index.Index(U32), reversed: W.Bytes}
