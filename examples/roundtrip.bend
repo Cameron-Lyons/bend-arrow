@@ -1,11 +1,12 @@
 import Base
 import ../src/duckdb.bend as DB
+import ../src/table.bend as T
 import ../src/parquet.bend as Parquet
 import ../src/arrow.bend as Arrow
 
-def show_total(table: DB.Table) -> IO(Unit):
+def show_total(table: T.Table) -> IO(Unit):
   match table:
-    case DB.Table{_, (DB.Signed{0, total} <> Nil{}) <> Nil{}}:
+    case T.Table{_, (T.Signed{0, total} <> Nil{}) <> Nil{}}:
       IO.print("Score total: " ++ U32.show(total))
     case _:
       IO.die(Unit, 1, "Expected one BIGINT total")
@@ -18,7 +19,7 @@ def roundtrip(+path: String) -> IO(Unit):
     sql : String = "SELECT name, score FROM " ++ Parquet.scan(path) ++ " WHERE score >= 7 OR score IS NULL"
     stream : Arrow.Stream <- IO.try(Arrow.Stream, Arrow.query(db, sql))
     IO.try(Unit, Arrow.into_table(db, "scores", stream))
-    total : DB.Table <- IO.try(DB.Table, DB.query(db, "SELECT sum(score)::BIGINT FROM scores"))
+    total : T.Table <- IO.try(T.Table, DB.query(db, "SELECT sum(score)::BIGINT FROM scores"))
     IO.try(Unit, DB.close(db))
     show_total(total)
 

@@ -1,11 +1,5 @@
-The ArrowSchema, ArrowArray and ArrowArrayStream definitions in native/arrow.h
-are adapted from the Apache Arrow C ABI header, licensed under Apache 2.0
-(see Apache-2.0.txt).
-
-Apache Arrow
-Copyright 2016-2026 The Apache Software Foundation
-This product includes software developed at The Apache Software Foundation
-(http://www.apache.org/).
-
-The DuckDB shared library and header obtained by scripts/fetch-duckdb are
-distributed under the MIT license in DuckDB.txt.
+The former native implementation distributed acknowledgements for the Apache
+Arrow C interface (Apache 2.0) and DuckDB (MIT). Their license texts are
+retained here for reference. The Bend implementation reads and writes Apache
+Arrow IPC streams and Apache Parquet files using their public format
+specifications.
