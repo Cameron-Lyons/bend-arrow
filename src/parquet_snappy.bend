@@ -2,31 +2,65 @@ import Base
 import ./parquet_wire.bend as W
 import ./random_access_list.bend as Index
 
+# Keep the reversed output and a pointer into it at each 64-byte boundary.
+# A copy can then find its source with one lookup and at most 63 list steps.
 type Output is Data:
-  Out{size: U32, index: Index.Index(U32), reversed: W.Bytes}
+  Out{size: U32, checkpoints: Index.Index(W.Bytes), reversed: W.Bytes}
 
-def emit(+b: U32, out: Output) -> Output:
-  Out{n, history, rev} = out
-  Out{(n + 1 : U32), Index.push(U32, b, history), b <> rev}
+def remember(n: U32, checkpoints: Index.Index(W.Bytes), +rev: W.Bytes, boundary: Bool) -> Output:
+  match boundary:
+    case True{}: Out{n, Index.push(W.Bytes, rev, checkpoints), rev}
+    case False{}: Out{n, checkpoints, rev}
+
+def emit(b: U32, out: Output) -> Output:
+  Out{n, checkpoints, rev} = out
+  +size = (n + 1 : U32)
+  remember(size, checkpoints, b <> rev, U32.is_zero((size .&. 63 : U32)))
 
 def literals(bs: W.Bytes, out: Output) -> Output:
   match bs:
     case Nil{}: out
     case h <> t: literals(t, emit(h, out))
 
-def from_history(found: Maybe<&2, U32>) -> W.R(U32):
+def from_checkpoint(found: Maybe<&2, W.Bytes>, skip: U32) -> W.R(W.Bytes):
   match found:
-    case None{}: W.fail(U32, "Snappy copy outside decoded prefix")
-    case Some{v}: Done{v}
+    case None{}: W.fail(W.Bytes, "Snappy copy outside decoded prefix")
+    case Some{rev}: W.skip(skip, rev)
 
-@unsafe def copy(n: U32, +offset: U32, +out: Output) -> W.R(Output):
-  match n:
-    case 0: Done{out}
-    case k:
-      Out{_, history, _} = out
-      do W.R<Output>:
-        b : U32 <- from_history(Index.seek(U32, history, (offset - 1 : U32)))
-        copy((k - 1 : U32), offset, emit(b, out))
+def history(out: Output, +end: U32, recent: Bool) -> W.R(W.Bytes):
+  Out{size, checkpoints, rev} = out
+  match recent:
+    case True{}: W.skip((size - end : U32), rev)
+    case False{}:
+      +skip = ((0 - end) .&. 63 : U32)
+      index = ((size >> 6n) - ((end + skip) >> 6n) : U32)
+      from_checkpoint(Index.seek(W.Bytes, checkpoints, index), skip)
+
+def window(bs: W.Bytes, n: U32, acc: W.Bytes) -> W.R(W.Bytes):
+  match bs n:
+    case _ 0: Done{acc}
+    case h <> t k: window(t, (k - 1 : U32), h <> acc)
+    case Nil{} _: W.fail(W.Bytes, "truncated Snappy copy source")
+
+# An overlapping copy repeats the original source bytes. A Snappy command
+# emits at most 64 bytes, so its forward-ordered window is small.
+def replay(n: Nat, bytes: W.Bytes, +cycle: W.Bytes, out: Output) -> W.R(Output):
+  match n bytes:
+    case 0n _: Done{out}
+    case 1n+p h <> t: replay(p, t, cycle, emit(h, out))
+    case 1n+p Nil{}:
+      match cycle:
+        case +h <> +t: replay(p, t, h <> t, emit(h, out))
+        case Nil{}: W.fail(Output, "empty Snappy copy source")
+
+def copy(+n: U32, +offset: U32, +out: Output) -> W.R(Output):
+  Out{+size, _, _} = out
+  +span = U32.min(n, offset)
+  +end = (size - offset + span : U32)
+  do W.R<Output>:
+    source : W.Bytes <- history(out, end, U32.is_lt((size - end : U32), 64))
+    +bytes : W.Bytes <- window(source, span, Nil{})
+    replay(U32.to_nat(n), bytes, bytes, out)
 
 def length(tag: U32, extended: Bool) -> W.P(U32):
   match extended:

@@ -87,7 +87,7 @@ def finish(schema: List<&2, T.Column>) -> List<&2, T.Column>:
 
 def infer(rows: Rows, schema: List<&2, T.Column>) -> L.Checked(List<&2, T.Column>):
   match rows:
-    case Nil{}: Done{finish(schema)}
+    case Nil{}: Done{schema}
     case h <> t:
       do L.Checked<List<&2, T.Column>>:
         new_schema : List<&2, T.Column> <- merge_row(schema, h)

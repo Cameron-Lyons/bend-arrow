@@ -51,4 +51,5 @@ jobs:
         env:
           CC: clang-23
           BEND_NO_TELEMETRY: '1'
-        run: make -j2 test
+        # Each Bend native compile needs most of the runner's memory.
+        run: make -j1 test

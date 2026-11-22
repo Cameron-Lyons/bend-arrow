@@ -28,7 +28,7 @@ def comparison(ref: E.ColumnRef, op: Comparison, lit: P.Literal) -> L.Checked(Pr
   E.Ref{index, _, +kind} = ref
   P.Lit{value, +other, _} = lit
   integer = (V.integer_kind(kind) || P.unsigned_kind(kind)) && V.integer_kind(other)
-  compatible = integer || (P.unsigned_kind(kind) && P.unsigned_kind(other)) || String.eq(kind, other) || String.eq(other, "NULL")
+  compatible = integer || (P.unsigned_kind(kind) && P.unsigned_kind(other)) || String.eq(kind, other) || String.eq(kind, "NULL") || String.eq(other, "NULL")
   P.expect(Predicate, compatible, Compare{index, op, value}, "comparison type differs from column")
 
 def constant_expr(e: P.Expr) -> L.Checked(P.Literal):

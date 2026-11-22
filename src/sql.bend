@@ -124,12 +124,36 @@ def query(sql: String, tables: List<&2, Entry>) -> L.Checked(T.Table):
     query_tokens(ts, tables)
 
 # File paths are case-sensitive and use ordinary SQL single-quote escaping.
-def file_path(tokens: L.Tokens) -> Maybe<&2, String>:
+def from_path(tokens: L.Tokens) -> Maybe<&2, String>:
   match tokens:
     case L.Keyword{"FROM"} <> L.Name{func} <> L.Symbol{40} <> L.StringLiteral{path} <> L.Symbol{41} <> _:
       Bool.pick(Maybe<&2, String>, String.eq(String.to_upper(func), "READ_PARQUET"), Some{path}, None{})
-    case _ <> rest: file_path(rest)
+    case L.Keyword{"FROM"} <> _: None{}
+    case L.Keyword{"WHERE"} <> _: None{}
+    case L.Keyword{"GROUP"} <> _: None{}
+    case L.Keyword{"ORDER"} <> _: None{}
+    case L.Symbol{59} <> _: None{}
+    case _ <> rest: from_path(rest)
     case Nil{}: None{}
+
+def select_path(tokens: L.Tokens) -> Maybe<&2, String>:
+  match tokens:
+    case L.Keyword{"SELECT"} <> tail: from_path(tail)
+    case _: None{}
+
+def create_path(tokens: L.Tokens) -> Maybe<&2, String>:
+  match tokens:
+    case L.Keyword{"TABLE"} <> L.Name{_} <> L.Keyword{"AS"} <> tail: select_path(tail)
+    case _: None{}
+
+# Only statements with a SELECT source can request external input.
+def file_path(tokens: L.Tokens) -> Maybe<&2, String>:
+  match tokens:
+    case L.Keyword{"CREATE"} <> L.Keyword{"TEMP"} <> tail: create_path(tail)
+    case L.Keyword{"CREATE"} <> L.Keyword{"TEMPORARY"} <> tail: create_path(tail)
+    case L.Keyword{"CREATE"} <> tail: create_path(tail)
+    case L.Keyword{"INSERT"} <> L.Keyword{"INTO"} <> L.Name{_} <> tail: select_path(tail)
+    case ts: select_path(ts)
 
 def file_tokens(result: L.Checked(L.Tokens)) -> Maybe<&2, String>:
   match result:

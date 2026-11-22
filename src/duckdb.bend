@@ -99,7 +99,7 @@ def query_ready(tokens: F.Outcome(Lexer.Tokens), r: F.Outcome(Session)) -> IO(F.
     case _ Fail{err}: IO.pure(F.Outcome(T.Table), Fail{err})
     case _ Done{Session{_, _, _, Some{AwaitingCommit{_, _, _}}}}: IO.pure(F.Outcome(T.Table), awaiting(T.Table))
     case Done{+ts} Done{Session{_, _, catalog, _}}:
-      from_source(SQL.file_path(ts), ts, C.visible(catalog))
+      from_source(SQL.select_path(ts), ts, C.visible(catalog))
 
 def query_slot(slot: Chan(Session), sql: String, received: Maybe<&1, Session>) -> IO(F.Outcome(T.Table)):
   match received:
@@ -208,6 +208,18 @@ def command(ts: Lexer.Tokens, +s: Session) -> IO(Step):
     case _ Session{_, _, _, Some{AwaitingCommit{_, _, _}}}: IO.pure(Step, Step{s, awaiting(Unit)})
     case tokens _: run_command(tokens, s)
 
+def on_refresh(r: F.Outcome(Session), original: Session, action: Session -> IO(Step)) -> IO(Step):
+  match r:
+    case Fail{err}: IO.pure(Step, Step{original, Fail{err}})
+    case Done{s}: action(s)
+
+# An autocommit statement following COMMIT or ROLLBACK starts a new snapshot,
+# including when both statements arrive in one exec call.
+def fresh_action(+s: Session, action: Session -> IO(Step)) -> IO(Step):
+  do IO<Step>:
+    r : F.Outcome(Session) <- refresh(s)
+    on_refresh(r, s, action)
+
 def statements(tokens: Lexer.Tokens, acc: Lexer.Tokens) -> List<&2, Lexer.Tokens>:
   match tokens:
     case Nil{}: [List.reverse(&2, Lexer.Token, acc)]
@@ -221,7 +233,7 @@ def commands(ts: List<&2, Lexer.Tokens>, state: Step) -> IO(Step):
     case Con{Nil{}, tail} Step{s, Done{_}}: commands(tail, success(s))
     case Con{head, tail} Step{s, Done{_}}:
       do IO<Step>:
-        result : Step <- command(head, s)
+        result : Step <- fresh_action(s, state => command(head, state))
         commands(tail, result)
 
 def execute_parsed(r: F.Outcome(Lexer.Tokens), s: Session) -> IO(Step):
@@ -241,11 +253,6 @@ def imported_table(name: String, +table: T.Table, c: C.Catalog) -> F.Outcome(C.C
 def imported(name: String, table: T.Table, +s: Session) -> IO(Step):
   edited(s, C.modified(imported_table(name, table, catalog(s)), False{}))
 
-def on_refresh(r: F.Outcome(Session), original: Session, action: Session -> IO(Step)) -> IO(Step):
-  match r:
-    case Fail{err}: IO.pure(Step, Step{original, Fail{err}})
-    case Done{s}: action(s)
-
 def put_back(slot: Chan(Session), step: Step) -> IO(F.Outcome(Unit)):
   Step{s, r} = step
   do IO<F.Outcome(Unit)>:
@@ -255,10 +262,9 @@ def put_back(slot: Chan(Session), step: Step) -> IO(F.Outcome(Unit)):
 def mutate_slot(slot: Chan(Session), action: Session -> IO(Step), value: Maybe<&1, Session>) -> IO(F.Outcome(Unit)):
   match value:
     case None{}: IO.pure(F.Outcome(Unit), closed(Unit))
-    case Some{+s}:
+    case Some{s}:
       do IO<F.Outcome(Unit)>:
-        r : F.Outcome(Session) <- refresh(s)
-        step : Step <- on_refresh(r, s, action)
+        step : Step <- action(s)
         put_back(slot, step)
 
 def mutate(db: Connection, action: Session -> IO(Step)) -> IO(F.Outcome(Unit)):
@@ -271,7 +277,7 @@ def exec(db: Connection, sql: String) -> IO(F.Outcome(Unit)):
   mutate(db, s => execute(sql, s))
 
 def register(db: Connection, name: String, t: T.Table) -> IO(F.Outcome(Unit)):
-  mutate(db, s => imported(name, t, s))
+  mutate(db, s => fresh_action(s, state => imported(name, t, state)))
 
 def close_slot(slot: Chan(Session), value: Maybe<&1, Session>) -> IO(F.Outcome(Unit)):
   match value:

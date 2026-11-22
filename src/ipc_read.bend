@@ -62,13 +62,53 @@ def encoding(+r: F.Region, pos: U32) -> F.R(D.Encoding):
         ty : A.Physical <- index_type(r, idx)
         return D.Encoded{id, ty}
 
+def ascii_equal(s: String, bs: F.Bytes, length: U32) -> Bool:
+  match s bs length:
+    case SNil{} _ 0: True{}
+    case _ _ 0: False{}
+    case SCon{Chr{c}, t} b <> rest k: U32.is_eq(c, b) && ascii_equal(t, rest, (k - 1 : U32))
+    case _ _ _: False{}
+
+def metadata_key(r: F.Region, pos: U32, length: U32, unsupported: String) -> F.R(Unit):
+  match unsupported:
+    case SNil{}: Done{Unit{}}
+    case +key:
+      do F.R<Unit>:
+        bs : F.Bytes <- F.suffix(r, (pos + 4 : U32))
+        F.check(Bool.not(ascii_equal(key, bs, length)), "unsupported metadata key " ++ key)
+
+# T.Table has no metadata slots. Check every key/value reference and string
+# boundary without copying application payloads (which may contain any bytes).
+@unsafe def metadata_entries(+r: F.Region, +pos: U32, n: U32, +unsupported: String) -> F.R(Unit):
+  match n:
+    case 0: Done{Unit{}}
+    case k:
+      do F.R<Unit>:
+        target : U32 <- F.indirect(r, pos)
+        +entry : F.Object <- F.object(r, target)
+        +key : U32 <- F.ref(entry, 0)
+        key_len : U32 <- F.text_length(r, key)
+        metadata_key(r, key, key_len, unsupported)
+        value : U32 <- F.ref(entry, 1)
+        _ : U32 <- F.text_length(r, value)
+        metadata_entries(r, (pos + 4 : U32), (k - 1 : U32), unsupported)
+
+def metadata_vector(r: F.Region, vec: F.Vector, unsupported: String) -> F.R(Unit):
+  F.Vector{pos, n} = vec
+  metadata_entries(r, pos, n, unsupported)
+
+def metadata(+o: F.Object, slot: U32, unsupported: String) -> F.R(Unit):
+  do F.R<Unit>:
+    vec : F.Vector <- F.vector(o, slot, 4)
+    metadata_vector(F.data(o), vec, unsupported)
+
 def field(+r: F.Region, target: U32) -> F.R(Field):
   do F.R<Field>:
     +o : F.Object <- F.object(r, target)
     dict : U32 <- F.slot(o, 4, 4)
     enc : D.Encoding <- encoding(r, dict)
     F.no_vector(o, 5, 4, "nested fields are unsupported")
-    F.no_vector(o, 6, 4, "custom field metadata is unsupported")
+    metadata(o, 6, "ARROW:extension:name")
     name_pos : U32 <- F.ref(o, 0)
     name_bytes : F.Bytes <- F.text(r, name_pos)
     name : String <- UTF8.decode(name_bytes)
@@ -115,7 +155,7 @@ def schema(+o: F.Object) -> F.R(Fields):
   do F.R<Fields>:
     endian : U32 <- F.scalar(o, 0, 2)
     F.check(U32.is_zero(endian), "only little-endian schemas are supported")
-    F.no_vector(o, 2, 4, "custom schema metadata is unsupported")
+    metadata(o, 2, "")
     features(o)
     fields : F.Vector <- F.vector(o, 1, 4)
     schema_fields(F.data(o), fields)
@@ -146,25 +186,25 @@ def pairs(r: F.Region, v: F.Vector) -> F.R(Pairs):
     pairs.go(bytes, n, Nil{})
 
 def Buffers() -> Data:
-  List<&2, F.Bytes>
+  List<&2, ArrayData.Buffer>
 
 # Buffers occur in schema order. Advance through the body once, skipping the
 # padding between buffers, and give each decoder only its declared bytes.
-def buffers(refs: Pairs, bs: F.Bytes, +prev_end: U32) -> F.R(Buffers):
+def buffers(refs: Pairs, bs: F.Bytes, prev_offset: U32, +prev_end: U32, +body_len: U32) -> F.R(Buffers):
   match refs:
     case Nil{}: Done{Nil{}}
     case Pair64{+off, +size} <> t:
       do F.R<Buffers>:
         F.check(U32.is_ge(off, prev_end) && U32.is_zero((off % 8 : U32)), "invalid buffer offset")
-        at : F.Bytes <- F.drop(bs, (off - prev_end : U32))
-        +span : F.Span <- F.split(at, size)
-        rest : Buffers <- buffers(t, F.tail(span), (off + size : U32))
-        return F.head(span) <> rest
+        F.check(F.fits(body_len, off, size), "buffer extends past message body")
+        +at : F.Bytes <- F.drop(bs, (off - prev_offset : U32))
+        rest : Buffers <- buffers(t, at, off, (off + size : U32), body_len)
+        return ArrayData.Buffer{at, size} <> rest
 
 type ColumnData is Data:
   ColumnData{cells: ArrayData.Cells, remaining: Buffers}
 
-def var_column(text: Bool, n: U32, nulls: U32, valid: F.Bytes, offsets: F.Bytes, bufs: Buffers) -> F.R(ColumnData):
+def var_column(text: Bool, n: U32, nulls: U32, valid: ArrayData.Buffer, offsets: ArrayData.Buffer, bufs: Buffers) -> F.R(ColumnData):
   match bufs:
     case Nil{}: F.fail(ColumnData, "missing variable-width data buffer")
     case data <> t:
@@ -210,7 +250,7 @@ def rows(fields: Fields, nodes: Pairs, bufs: Buffers, +n: U32, +reg: D.Registry)
   match fields nodes:
     case Nil{} Nil{}:
       do F.R<Rows>:
-        F.check(List.is_empty(&2, F.Bytes, bufs), "extra record batch buffers")
+        F.check(List.is_empty(&2, ArrayData.Buffer, bufs), "extra record batch buffers")
         return Nil{}
     case Field{_, k, nullable, enc} <> rest Pair64{length, +nulls} <> trailing:
       do F.R<Rows>:
@@ -227,7 +267,7 @@ def batch_rows(fields: Fields, nodes: Pairs, bs: Buffers, +n: U32, reg: D.Regist
   match fields:
     case Nil{}:
       do F.R<Rows>:
-        F.check(List.is_empty(&2, Pair64, nodes) && List.is_empty(&2, F.Bytes, bs), "unexpected data for zero-column batch")
+        F.check(List.is_empty(&2, Pair64, nodes) && List.is_empty(&2, ArrayData.Buffer, bs), "unexpected data for zero-column batch")
         F.check(U32.is_le(n, 1048576), "zero-column batch exceeds empty-row materialization limit")
         return List.replicate(List<&2, T.Cell>, U32.to_nat(n), Nil{})
     case _: rows(fields, nodes, bs, n, reg)
@@ -235,7 +275,13 @@ def batch_rows(fields: Fields, nodes: Pairs, bs: Buffers, +n: U32, reg: D.Regist
 type Batch is Data:
   Batch{n: U32, nodes: Pairs, buffers: Buffers}
 
-def batch(+o: F.Object, body: F.Bytes) -> F.R(Batch):
+# Keep a view of the incoming list. Each buffer is bounded by body_len before
+# extraction, so framing does not need to copy a whole record batch.
+type Body is Data:
+  Body{bytes: F.Bytes, length: U32}
+
+def batch(+o: F.Object, body: Body) -> F.R(Batch):
+  Body{bytes, length} = body
   do F.R<Batch>:
     +n : U32 <- F.scalar(o, 0, 8)
     F.check(U32.is_le(n, 2147483647), "row count exceeds supported range")
@@ -246,27 +292,29 @@ def batch(+o: F.Object, body: F.Bytes) -> F.R(Batch):
     refs : F.Vector <- F.vector(o, 2, 16)
     ns : Pairs <- pairs(F.data(o), nodes)
     offsets : Pairs <- pairs(F.data(o), refs)
-    bs : Buffers <- buffers(offsets, body, 0)
+    bs : Buffers <- buffers(offsets, bytes, 0, 0, length)
     return Batch{n, ns, bs}
 
 type Frame is Data:
   End{}
-  Frame{tag: U32, header: F.Object, body: F.Bytes, rest: F.Bytes}
+  Frame{tag: U32, header: F.Object, body: Body, rest: F.Bytes}
 
-def message(+meta: F.Region, remaining: F.Bytes) -> F.R(Frame):
+def message(+meta: F.Region, +remaining: F.Bytes) -> F.R(Frame):
   do F.R<Frame>:
     root : U32 <- F.indirect(meta, 0)
     +o : F.Object <- F.object(meta, root)
-    version : U32 <- F.scalar(o, 0, 2)
-    F.check(U32.is_eq(version, 4), "expected V5 metadata")
-    F.no_vector(o, 4, 4, "custom message metadata is unsupported")
+    +version : U32 <- F.scalar(o, 0, 2)
+    # V4 and V5 share the wire layout for the supported flat scalar types.
+    F.check(U32.is_eq(version, 3) || U32.is_eq(version, 4), "expected V4 or V5 metadata")
+    # Arrow 0.17 signaled compressed V4 bodies through a message-level key.
+    metadata(o, 4, Bool.pick(String, U32.is_eq(version, 3), "ARROW:experimental_compression", ""))
     tag : U32 <- F.scalar(o, 1, 1)
     header : U32 <- F.ref(o, 2)
     obj : F.Object <- F.object(meta, header)
     +body_len : U32 <- F.scalar(o, 3, 8)
-    F.check(U32.is_zero((body_len % 8 : U32)), "misaligned body length")
-    +part : F.Span <- F.split(remaining, body_len)
-    return Frame{tag, obj, F.head(part), F.tail(part)}
+    F.check(U32.is_le(body_len, 2147483647) && U32.is_zero((body_len % 8 : U32)), "invalid body length")
+    rest : F.Bytes <- F.drop(remaining, body_len)
+    return Frame{tag, obj, Body{remaining, body_len}, rest}
 
 def frame_data(bs: F.Bytes, n: U32, prefix: U32) -> F.R(Frame):
   match n:
@@ -313,11 +361,11 @@ def dictionary_cells(b: Batch, kind: A.Physical) -> F.R(ArrayData.Cells):
       do F.R<ArrayData.Cells>:
         F.check(U32.is_eq(n, len) && U32.is_le(nulls, n), "inconsistent dictionary field node")
         +c : ColumnData <- read_column(kind, n, nulls, bs)
-        F.check(List.is_empty(&2, F.Bytes, get_rest(c)), "extra dictionary buffers")
+        F.check(List.is_empty(&2, ArrayData.Buffer, get_rest(c)), "extra dictionary buffers")
         return get_cells(c)
     case _: F.fail(ArrayData.Cells, "expected one dictionary field node")
 
-def dictionary(+o: F.Object, body: F.Bytes, +reg: D.Registry) -> F.R(D.Registry):
+def dictionary(+o: F.Object, body: Body, +reg: D.Registry) -> F.R(D.Registry):
   do F.R<D.Registry>:
     +id : String <- D.id(o)
     +dict : D.Dictionary <- D.require(D.lookup(reg, id))
@@ -353,7 +401,7 @@ def materialize(b: Batch, fields: Fields, reg: D.Registry) -> F.R(Rows):
 
 def first(f: Frame) -> F.R(T.Table):
   match f:
-    case Frame{1, header, Nil{}, rest}:
+    case Frame{1, header, Body{_, 0}, rest}:
       do F.R<T.Table>:
         +fields : Fields <- schema(header)
         frame : Frame <- next(rest)
