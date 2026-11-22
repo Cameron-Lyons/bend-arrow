@@ -46,7 +46,7 @@ ORDER BY total DESC
 
 Use `UPDATE table SET a = b, b = a WHERE …` to change matching rows. Each assignment reads the original row and accepts a compatible column or literal. `DELETE FROM table WHERE …` removes matching rows. Omitting `WHERE` applies either command to every row. Both commands participate in transactions.
 
-File-backed connections refresh committed data before each statement outside a transaction, including statements in the same `DB.exec` call. A transaction reads a snapshot. A competing commit against the same revision returns a conflict and ends the losing transaction. If a write succeeds but its confirmation cannot be read, the connection reports error 115. Retry `COMMIT` on that connection to resolve the original write. Temporary tables stay local to their connection. The store appends full catalog snapshots, so file size grows with each persistent commit. Existing DuckDB files require export to a supported interchange format before use.
+File-backed connections refresh committed data before each statement outside a transaction, including statements in the same `DB.exec` call. A transaction reads a snapshot. A competing commit against the same revision returns a conflict and ends the losing transaction. If a write succeeds but its confirmation cannot be read, the connection reports error 115. Retry `COMMIT` on that connection to resolve the original write. Temporary tables stay local to their connection. The store appends full catalog snapshots, so file size grows with each persistent commit. Group related writes in a transaction to avoid serializing a snapshot for every statement. Existing DuckDB files require export to a supported interchange format before use.
 
 ## Parquet and Arrow
 
@@ -65,15 +65,17 @@ Operations that perform I/O return `IO(Result<…>)`. Use `IO.try` to stop on fa
 
 Both codecs support flat nullable booleans, signed and unsigned integers of 8, 16, 32, and 64 bits, 32- and 64-bit floating point, UTF-8 strings, and binary data. A 64-bit cell stores its high and low 32-bit words. Table constructors also include 128-bit integer cells, which are outside the supported interchange profile.
 
-The Parquet writer emits an uncompressed file with PLAIN data pages (version 1) and RLE definition levels. The reader handles multiple row groups and pages, required and optional fields, and both data page versions 1 and 2. It reads PLAIN and dictionary-encoded values, RLE-encoded booleans, and uncompressed or Snappy-compressed pages. When a page includes a CRC-32 checksum, the reader verifies the stored bytes before decoding them. Nested schemas and other compression codecs are outside this profile. The Parquet and IPC file APIs materialize their input and accept files smaller than 2 GiB.
+The Parquet writer emits an uncompressed file with PLAIN data pages (version 1) and RLE/bit-packed hybrid definition levels. The reader handles multiple row groups and pages, required and optional fields, and both data page versions 1 and 2. It reads PLAIN and dictionary-encoded values, RLE-encoded booleans, and uncompressed or Snappy-compressed pages. When a page includes a CRC-32 checksum, the reader verifies the stored bytes before decoding them. Nested schemas and other compression codecs are outside this profile. The Parquet and IPC file APIs materialize their input and accept files smaller than 2 GiB.
 
 Arrow interchange reads little-endian, uncompressed V4 and V5 IPC **streams** and writes V5. PyArrow callers can use `pyarrow.ipc.open_stream` and `pyarrow.ipc.new_stream`. The reader combines incoming record batches, including zero-row batches. It expands dictionary arrays of the supported scalar types into ordinary cells and handles dictionary replacements and deltas. The reader accepts application metadata on schemas, fields, and messages. The table model retains column names, types, and values and discards that metadata. The writer emits plain arrays. Nested types, extension types, IPC file-format containers, and the former in-process C callback interface are outside this API. See the [Arrow IPC specification](https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc) and [Parquet format](https://github.com/apache/parquet-format).
 
 ## Verification
 
-`make test` runs the Bend SQL, connection, transaction, Parquet, and IPC tests and the round-trip example. Tests read checked-in binary fixtures produced by PyArrow and the earlier DuckDB-backed example, so running them requires only the Bend toolchain and Make.
+`make test` runs the Bend SQL, connection, transaction, Parquet, and IPC tests and the round-trip example. Native compilation runs sequentially to bound compiler memory use. Tests read checked-in binary fixtures produced by PyArrow and the earlier DuckDB-backed example, so running them requires only the Bend toolchain and Make.
 
-GitHub Actions runs the same target with Clang 23 on Ubuntu 26.04 for every pull request and push to `main`.
+For independent interoperability checks, install PyArrow in a Python environment and run `make test-interop PYTHON=/path/to/python`. This optional target checks all supported scalar types, integer and floating-point boundaries, nulls, sliced and empty batches, dictionaries, IPC V4/V5, and Parquet V1/V2 pages with and without Snappy. PyArrow verifies both IPC and Parquet files written by Bend. The normal `make test` target has no Python dependency.
+
+GitHub Actions runs `make test` with Clang 23 on Ubuntu 26.04 for every pull request and push to `main`.
 
 ## License
 

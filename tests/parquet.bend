@@ -2,6 +2,7 @@ import Base
 import ../src/table.bend as T
 import ../src/file_bytes.bend as Files
 import ../src/parquet_read.bend as Reader
+import ../src/parquet_write.bend as Writer
 import ../src/parquet_hybrid.bend as Hybrid
 import ../src/parquet_snappy.bend as Snappy
 
@@ -144,6 +145,66 @@ def same_bytes(xs: Files.Bytes, ys: Files.Bytes) -> Bool:
     case x <> xt y <> yt: U32.is_eq(x, y) && same_bytes(xt, yt)
     case _ _: False{}
 
+def decoded_levels(expected: Files.Bytes, result: Files.Outcome(Files.Bytes)) -> Bool:
+  match result:
+    case Done{actual}: same_bytes(expected, actual)
+    case Fail{_}: False{}
+
+def level_roundtrip(+bits: Files.Bytes) -> Bool:
+  decoded_levels(bits, Hybrid.decode(Writer.byte_count(bits, 0), 1, Writer.level_bytes(bits)))
+
+def level_pattern(n: Nat, +word: U32) -> Files.Bytes:
+  match n:
+    case 0n: Nil{}
+    case 1n+p: (word .&. 1 : U32) <> level_pattern(p, (word >> 1n : U32))
+
+def level_tails(+bits: Files.Bytes) -> Bool:
+  match bits:
+    case Nil{}: level_roundtrip(Nil{})
+    case _ <> tail: level_roundtrip(bits) && level_tails(tail)
+
+def level_variants(n: Nat) -> Bool:
+  match n:
+    case 0n: True{}
+    case 1n+ +p:
+      +bits = level_pattern(8n, U32.from_nat(p))
+      # Mixed and uniform blocks in both directions, followed by a short tail.
+      combined = List.concat(&2, U32, [List.replicate(U32, 16n, 1), bits, bits, List.replicate(U32, 8n, 0), [1, 0, 1]])
+      level_tails(bits) && level_roundtrip(combined) && level_variants(p)
+
+def alternating(n: Nat, +bit: U32) -> Files.Bytes:
+  match n:
+    case 0n: Nil{}
+    case 1n+p: bit <> alternating(p, (1 - bit : U32))
+
+def nullable_rows(bits: Files.Bytes) -> T.Rows:
+  match bits:
+    case Nil{}: Nil{}
+    case h <> t: [Bool.pick(T.Cell, U32.is_zero(h), T.Null{}, T.Signed{0, 17})] <> nullable_rows(t)
+
+def nullable_cells(bits: Files.Bytes, rows: T.Rows) -> Bool:
+  match bits rows:
+    case Nil{} Nil{}: True{}
+    case Con{0, t} Con{Con{T.Null{}, Nil{}}, rest}: nullable_cells(t, rest)
+    case Con{1, t} Con{Con{T.Signed{0, 17}, Nil{}}, rest}: nullable_cells(t, rest)
+    case _ _: False{}
+
+def nullable_table(bits: Files.Bytes, table: T.Table) -> Bool:
+  match table:
+    case T.Table{T.Column{"n", "INTEGER"} <> Nil{}, rows}: nullable_cells(bits, rows)
+    case _: False{}
+
+def test_levels() -> IO(Unit):
+  +mixed = alternating(256n, 0)
+  +bits = List.concat(&2, U32, [List.replicate(U32, 80n, 1), mixed, List.replicate(U32, 16n, 0), [1, 0, 1]])
+  do IO<Unit>:
+    expect(level_variants(256n), "hybrid definition levels changed null positions at a run or padding boundary")
+    expect(U32.is_eq(Writer.byte_count(Writer.level_bytes(mixed), 0), 33), "alternating nulls are not bit packed")
+    expect(U32.is_eq(Writer.byte_count(Writer.level_bytes(List.replicate(U32, 256n, 1)), 0), 3), "uniform definition levels lost RLE compression")
+    bytes : Files.Bytes <- IO.try(Files.Bytes, IO.pure(Files.Outcome(Files.Bytes), Writer.encode(T.Table{[T.Column{"n", "INTEGER"}], nullable_rows(bits)})))
+    table : T.Table <- IO.try(T.Table, IO.pure(Files.Outcome(T.Table), Reader.decode(bytes)))
+    expect(nullable_table(bits, table), "Parquet hybrid validity round trip changed rows")
+
 def test_snappy() -> IO(Unit):
   # A 128-byte literal, two long-distance copies spanning checkpoints, and
   # two overlapping copies. The commands use all three Snappy offset widths.
@@ -162,6 +223,7 @@ def main() -> IO(Unit):
     test_v2()
     test_checksums()
     test_snappy()
+    test_levels()
     raw : Files.Bytes <- IO.try(Files.Bytes, Files.read("tests/fixtures/primitive-types.parquet"))
     typed : T.Table <- IO.try(T.Table, IO.pure(Files.Outcome(T.Table), Reader.decode(raw)))
     expect(primitive_table(typed), "numeric widths, floating-point words or packed booleans changed")

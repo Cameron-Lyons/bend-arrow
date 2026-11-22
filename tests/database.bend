@@ -135,6 +135,8 @@ def check_file(+path: String) -> IO(Unit):
     row_edits(a, b)
     IO.try(Unit, DB.close(a))
     IO.try(Unit, DB.exec(b, "INSERT INTO items VALUES (43)"))
+    IO.try(Unit, DB.exec(b, "BEGIN; INSERT INTO items VALUES (44)"))
+    count(b, 4)
     IO.try(Unit, DB.close(b))
     +reopened : DB.Connection <- IO.try(DB.Connection, DB.open(path))
     stale : Result<&1, &1, (U32 & String), T.Table> <- DB.query(a, "SELECT count(*) FROM items")

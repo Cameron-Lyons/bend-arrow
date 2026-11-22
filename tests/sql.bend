@@ -175,6 +175,45 @@ def check_bindings() -> IO(Unit):
     cast : T.Table <- IO.try(T.Table, IO.pure(Result<&1, &1, U32 & String, T.Table>, SQL.query("select age::bigint, 1::int, null::int, age::integer from ages", [SQL.Entry{"ages", ages}])))
     assert(int_casts(cast), "INT and INTEGER casts disagree")
 
+def projection_cells(actual: List<&2, T.Cell>, expected: List<&2, T.Cell>) -> Bool:
+  match actual expected:
+    case Nil{} Nil{}: True{}
+    case T.Null{} <> xs T.Null{} <> ys: projection_cells(xs, ys)
+    case T.Signed{ah, al} <> xs T.Signed{bh, bl} <> ys:
+      U32.is_eq(ah, bh) && U32.is_eq(al, bl) && projection_cells(xs, ys)
+    case _ _: False{}
+
+def projection_rows(actual: T.Rows, expected: T.Rows) -> Bool:
+  match actual expected:
+    case Nil{} Nil{}: True{}
+    case row <> rows want <> rest: projection_cells(row, want) && projection_rows(rows, rest)
+    case _ _: False{}
+
+def reordered_projection(table: T.Table) -> Bool:
+  T.Table{_, rows} = table
+  projection_rows(rows,
+    [[T.Signed{0, 4}, T.Signed{0, 2}, T.Signed{0, 2}, T.Null{}, T.Signed{0, 1}, T.Signed{0, 3}, T.Signed{0, 4}],
+     [T.Signed{0, 8}, T.Null{}, T.Null{}, T.Null{}, T.Signed{0, 5}, T.Signed{0, 7}, T.Signed{0, 8}]])
+
+def sparse_projection(table: T.Table) -> Bool:
+  match table:
+    case T.Table{[T.Column{"first", "INTEGER"}, T.Column{"third", "BIGINT"}, T.Column{"fourth", "INTEGER"}], rows}:
+      projection_rows(rows,
+        [[T.Signed{0, 1}, T.Signed{0, 3}, T.Signed{0, 4}],
+         [T.Signed{0, 5}, T.Signed{0, 7}, T.Signed{0, 8}]])
+    case _: False{}
+
+def check_projection_and_constants() -> IO(Unit):
+  do IO<Unit>:
+    reordered : T.Table <- checked("select d::bigint, b, b, null::varchar, a, c, d from (values (1,2,3,4),(5,null,7,8)) as t(a,b,c,d)")
+    assert(reordered_projection(reordered), "reordered or repeated projection lost its source position")
+    sparse : T.Table <- checked("select a as first, c::bigint as third, d as fourth from (values (1,2,3,4),(5,null,7,8)) as t(a,b,c,d) where (a = 1 or true) and (false or true)")
+    assert(sparse_projection(sparse), "sparse projection, aliases, casts or constant WHERE changed rows")
+    filtered : T.Table <- checked("select 'total', count(n), count(*) from range(4) as t(n) where (n >= 0 or true) and (n = 0 and false)")
+    assert(counts(filtered, 0, 0), "constant false WHERE retained rows")
+    assert(fails("select * from range(4) where false and missing = 1"), "constant folding skipped WHERE column binding")
+    assert(fails("select * from range(4) where true or (range = 'bad')"), "constant folding skipped WHERE type checking")
+
 def main() -> IO(Unit):
   do IO<Unit>:
     a : T.Table <- checked("select sum(n)::bigint AS total, count(*) from (values (12), (7), (NULL), (2)) as t(n) where n >= 7 OR n is null;")
@@ -203,4 +242,5 @@ def main() -> IO(Unit):
     check_keys()
     check_bindings()
     check_untyped_values()
+    check_projection_and_constants()
     IO.print("SQL queries passed")
