@@ -139,10 +139,16 @@ def alias(found: Bool, rest: L.Tokens) -> L.Checked(Maybe<&2, String>):
     case True{} Con{L.Name{name}, Nil{}}: Done{Some{name}}
     case _ _: L.error(Maybe<&2, String>, "expected an identifier after AS")
 
+# INT and INTEGER name the same SQL type.
+def canonical_type(kind: String) -> String:
+  match kind:
+    case "INT": "INTEGER"
+    case other: other
+
 def cast(found: Bool, rest: L.Tokens) -> L.Checked(Maybe<&2, String>):
   match found rest:
     case False{} Nil{}: Done{None{}}
-    case True{} Con{L.Symbol{58}, Con{L.Name{name}, Nil{}}}: Done{Some{String.to_upper(name)}}
+    case True{} Con{L.Symbol{58}, Con{L.Name{name}, Nil{}}}: Done{Some{canonical_type(String.to_upper(name))}}
     case _ _: L.error(Maybe<&2, String>, "expected ::TYPE")
 
 def numeric_expr(+kind: String, +whole: String, +negative: Bool, unsigned: Bool) -> L.Checked(Expr):

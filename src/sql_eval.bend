@@ -7,16 +7,28 @@ import ./table.bend as T
 type ColumnRef is Data:
   Ref{index: Nat, name: String, kind: String}
 
-def find_hit(hit: Bool, col: ColumnRef, more: Unit -> L.Checked(ColumnRef)) -> L.Checked(ColumnRef):
-  match hit:
-    case True{}: Done{col}
-    case False{}: more(Unit{})
+def finish_find(found: Maybe<&2, ColumnRef>, name: String) -> L.Checked(ColumnRef):
+  match found:
+    case None{}: L.error(ColumnRef, "unknown column " ++ name)
+    case Some{ref}: Done{ref}
 
-def find(cols: List<&2, T.Column>, +wanted: String, +index: Nat) -> L.Checked(ColumnRef):
+def find_hit(hit: Bool, prior: Maybe<&2, ColumnRef>, ref: ColumnRef, more: Maybe<&2, ColumnRef> -> L.Checked(ColumnRef)) -> L.Checked(ColumnRef):
+  match hit prior:
+    case True{} Some{_}:
+      Ref{_, name, _} = ref
+      L.error(ColumnRef, "ambiguous column " ++ name)
+    case True{} None{}: more(Some{ref})
+    case False{} found: more(found)
+
+def find_column(cols: List<&2, T.Column>, +upper: String, name: String, +index: Nat, found: Maybe<&2, ColumnRef>) -> L.Checked(ColumnRef):
   match cols:
-    case Nil{}: L.error(ColumnRef, "unknown column " ++ wanted)
-    case T.Column{+name, kind} <> rest:
-      find_hit(String.eq(String.to_upper(name), String.to_upper(wanted)), Ref{index, name, kind}, _ => find(rest, wanted, 1n+index))
+    case Nil{}: finish_find(found, name)
+    case T.Column{+label, kind} <> rest:
+      equal = String.eq(String.to_upper(label), upper)
+      find_hit(equal, found, Ref{index, label, kind}, next => find_column(rest, upper, name, 1n+index, next))
+
+def find(cols: List<&2, T.Column>, +wanted: String, index: Nat) -> L.Checked(ColumnRef):
+  find_column(cols, String.to_upper(wanted), wanted, index, None{})
 
 def at(row: List<&2, T.Cell>, index: Nat) -> L.Checked(T.Cell):
   match row index:
@@ -44,7 +56,7 @@ def from_count(ref: ColumnRef) -> Output:
 
 def from_sum(ref: ColumnRef) -> L.Checked(Output):
   Ref{index, name, +kind} = ref
-  P.expect(Output, V.integer_kind(kind) || P.unsigned_kind(kind), Out{SumAt{index}, T.Column{"sum(" ++ name ++ ")", "BIGINT"}}, "SUM expects an integer column")
+  P.expect(Output, V.integer_kind(kind) || P.unsigned_kind(kind) || String.eq(kind, "NULL"), Out{SumAt{index}, T.Column{"sum(" ++ name ++ ")", "BIGINT"}}, "SUM expects an integer column")
 
 def bind_expr(e: P.Expr, cols: List<&2, T.Column>) -> L.Checked(Output):
   match e:
@@ -67,7 +79,8 @@ def cast_type(cast: Maybe<&2, String>, src: Bound, label: String, +old: String) 
   match cast:
     case None{}: Done{Out{src, T.Column{label, old}}}
     case Some{+typ}:
-      allowed = String.eq(old, typ) || (String.eq(old, "INTEGER") && String.eq(typ, "BIGINT")) || (String.eq(old, "NULL") && (V.integer_kind(typ) || P.unsigned_kind(typ) || String.eq(typ, "VARCHAR") || String.eq(typ, "BOOLEAN") || String.eq(typ, "FLOAT") || String.eq(typ, "DOUBLE")))
+      +source = P.canonical_type(old)
+      allowed = String.eq(source, typ) || (String.eq(source, "INTEGER") && String.eq(typ, "BIGINT")) || (String.eq(source, "NULL") && (V.integer_kind(typ) || P.unsigned_kind(typ) || String.eq(typ, "VARCHAR") || String.eq(typ, "BOOLEAN") || String.eq(typ, "FLOAT") || String.eq(typ, "DOUBLE")))
       P.expect(Output, allowed, Out{src, T.Column{label, typ}}, "unsupported SQL cast")
 
 def with_cast(col: Output, name: Maybe<&2, String>, cast: Maybe<&2, String>) -> L.Checked(Output):
@@ -229,11 +242,23 @@ def select_kind(agg: Bool, +outputs: List<&2, Output>, rows: List<&2, List<&2, T
         result : List<&2, List<&2, T.Cell>> <- project_rows(rows, outputs, Nil{})
         return T.Table{output_columns(outputs), result}
 
+def all_fields(cols: List<&2, T.Column>, +index: Nat) -> List<&2, Output>:
+  match cols:
+    case Nil{}: Nil{}
+    case column <> rest: Out{At{index}, column} <> all_fields(rest, 1n+index)
+
+def bind_select(tokens: L.Tokens, cols: List<&2, T.Column>) -> L.Checked(List<&2, Output>):
+  match tokens:
+    case L.Symbol{42} <> Nil{}: Done{all_fields(cols, 0n)}
+    case ts:
+      do L.Checked<List<&2, Output>>:
+        items : List<&2, P.Item> <- P.items(P.segments(ts, Nil{}, Nil{}))
+        bind(items, cols)
+
 def select(tokens: L.Tokens, table: T.Table) -> L.Checked(T.Table):
   match tokens table:
     case Con{L.Symbol{42}, Nil{}} t: Done{t}
     case ts T.Table{cols, rows}:
       do L.Checked<T.Table>:
-        items : List<&2, P.Item> <- P.items(P.segments(ts, Nil{}, Nil{}))
-        +outputs : List<&2, Output> <- bind(items, cols)
+        +outputs : List<&2, Output> <- bind_select(ts, cols)
         select_kind(has_aggregate(outputs), outputs, rows)

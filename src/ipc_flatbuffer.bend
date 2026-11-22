@@ -186,10 +186,15 @@ def no_vector(o: Object, idx: U32, stride: U32, why: String) -> R(Unit):
     v : Vector <- vector(o, idx, stride)
     empty(v, why)
 
-def text(+r: Region, +pos: U32) -> R(Bytes):
-  do R<Bytes>:
+def text_length(+r: Region, +pos: U32) -> R(U32):
+  do R<U32>:
     +n : U32 <- at(r, pos, 4)
     check(U32.is_lt(n, (size(r) - pos - 4 : U32)), "truncated string")
     zero : U32 <- at(r, (pos + 4 + n : U32), 1)
     check(U32.is_zero(zero), "unterminated string")
+    return n
+
+def text(+r: Region, +pos: U32) -> R(Bytes):
+  do R<Bytes>:
+    n : U32 <- text_length(r, pos)
     span(r, (pos + 4 : U32), n)

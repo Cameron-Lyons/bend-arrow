@@ -1,6 +1,8 @@
 import Base
 import ../src/table.bend as T
 import ../src/file_bytes.bend as FileBytes
+import ../src/utf8.bend as UTF8
+import ../src/arrow_layout.bend as Layout
 import ../src/ipc_flatbuffer.bend as F
 import ../src/ipc_read.bend as Reader
 import ../src/ipc_write.bend as Writer
@@ -112,6 +114,68 @@ def check_zero_columns() -> F.R(Unit):
     result : T.Table <- Reader.decode(bytes)
     F.check(empty_rows(result), "zero-column record batch lost rows")
 
+# PyArrow 26.0.1 wrote the same 14 rows using legacy V4 and modern V5 framing.
+# Both schemas have binary-valued field metadata and a pandas metadata key.
+# The V5 record batch carries its own application metadata.
+def metadata_rows(n: Nat, +i: U32) -> T.Rows:
+  match n:
+    case 0n: Nil{}
+    case 1n+k:
+      id = Bool.pick(T.Cell, U32.is_eq((i % 4 : U32), 2), T.Null{}, T.Signed{0, i})
+      ok = Bool.pick(T.Cell, U32.is_eq((i % 5 : U32), 3), T.Null{}, T.Boolean{U32.is_even(i)})
+      [id, ok] <> metadata_rows(k, U32.inc(i))
+
+def check_metadata(stream: F.Bytes) -> F.R(Unit):
+  expected : T.Table = T.Table{[T.Column{"id", "INTEGER"}, T.Column{"ok", "BOOLEAN"}], metadata_rows(14n, 0)}
+  do F.R<Unit>:
+    table : T.Table <- Reader.decode(stream)
+    actual : F.Bytes <- Writer.encode(table)
+    wanted : F.Bytes <- Writer.encode(expected)
+    F.check(equal_bytes(actual, wanted), "application metadata changed table values")
+
+def overwrite(bs: F.Bytes, position: U32, +replacement: F.Bytes) -> F.R(F.Bytes):
+  do F.R<F.Bytes>:
+    +parts : F.Span <- F.split(bs, position)
+    rest : F.Bytes <- F.drop(F.tail(parts), Layout.length(U32, replacement))
+    return Writer.chunks([F.head(parts), replacement, rest])
+
+def rejected_with(result: F.R(T.Table), message: String) -> F.R(Unit):
+  match result:
+    case Fail{(22, +why)}: F.check(String.eq(why, "Arrow IPC: " ++ message), why)
+    case _: F.fail(Unit, "invalid IPC metadata was accepted")
+
+def check_metadata_errors(+stream: F.Bytes) -> F.R(Unit):
+  do F.R<Unit>:
+    # Replace the fixture's 20-byte field key with an extension declaration.
+    name : F.Bytes <- UTF8.encode("ARROW:extension:name")
+    extension : F.Bytes <- overwrite(stream, 264, name)
+    rejected_with(Reader.decode(extension), "unsupported metadata key ARROW:extension:name")
+    # Change the batch metadata version to V4 and turn its application key
+    # into the old experimental body-compression marker.
+    v4 : F.Bytes <- overwrite(stream, 350, [3])
+    marker : F.Bytes <- UTF8.encode("ARROW")
+    compressed : F.Bytes <- overwrite(v4, 408, marker)
+    rejected_with(Reader.decode(compressed), "unsupported metadata key ARROW:experimental_compression")
+    # Shorten the declared 80-byte body while leaving the physical bytes and
+    # next frame intact. A buffer may never consume either as part of its data.
+    short : F.Bytes <- overwrite(stream, 360, [72])
+    rejected_with(Reader.decode(short), "buffer extends past message body")
+    unterminated : F.Bytes <- overwrite(stream, 98, [1])
+    rejected_with(Reader.decode(unterminated), "unterminated string")
+
+# Shorten descriptors while leaving their bytes in the stream. Array decoders
+# must honor each declared length even when enough padding or data follows.
+def check_buffer_bounds(+metadata: F.Bytes, +scalars: F.Bytes) -> F.R(Unit):
+  do F.R<Unit>:
+    bitmap : F.Bytes <- overwrite(metadata, 536, [1])
+    rejected_with(Reader.decode(bitmap), "truncated bitmap")
+    fixed : F.Bytes <- overwrite(metadata, 504, [55])
+    rejected_with(Reader.decode(fixed), "truncated primitive array")
+    offsets : F.Bytes <- overwrite(scalars, 1184, [12])
+    rejected_with(Reader.decode(offsets), "truncated variable-width offsets")
+    text : F.Bytes <- overwrite(scalars, 1200, [6])
+    rejected_with(Reader.decode(text), "invalid variable-width offset")
+
 def check_corrupt(+external: F.Bytes) -> F.R(Unit):
   do F.R<Unit>:
     rejected(Reader.decode([255, 255, 255, 255, 8, 0, 0, 0, 254, 255, 255, 255, 0, 0, 0, 0]))
@@ -123,9 +187,15 @@ def main() -> IO(Unit):
   do IO<Unit>:
     +bytes : F.Bytes <- IO.try(F.Bytes, FileBytes.read("tests/fixtures/pyarrow-v5.arrows"))
     +dictionaries : F.Bytes <- IO.try(F.Bytes, FileBytes.read("tests/fixtures/pyarrow-dictionaries.arrows"))
+    +metadata : F.Bytes <- IO.try(F.Bytes, FileBytes.read("tests/fixtures/pyarrow-metadata.arrows"))
+    legacy : F.Bytes <- IO.try(F.Bytes, FileBytes.read("tests/fixtures/pyarrow-legacy-v4.arrows"))
     IO.try(Unit, IO.pure(F.R(Unit), check_stream(bytes)))
     IO.try(Unit, IO.pure(F.R(Unit), check_dictionaries(dictionaries)))
     IO.try(Unit, IO.pure(F.R(Unit), check_keys(dictionaries)))
     IO.try(Unit, IO.pure(F.R(Unit), check_corrupt(bytes)))
     IO.try(Unit, IO.pure(F.R(Unit), check_zero_columns()))
+    IO.try(Unit, IO.pure(F.R(Unit), check_metadata(metadata)))
+    IO.try(Unit, IO.pure(F.R(Unit), check_metadata(legacy)))
+    IO.try(Unit, IO.pure(F.R(Unit), check_metadata_errors(metadata)))
+    IO.try(Unit, IO.pure(F.R(Unit), check_buffer_bounds(metadata, bytes)))
     IO.print("Arrow IPC interoperability passed")

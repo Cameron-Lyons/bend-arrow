@@ -30,12 +30,16 @@ def keywords() -> List<&2, String>:
    "WHERE", "AS", "VALUES", "IS", "NOT", "NULL", "OR", "AND",
    "TRUE", "FALSE"]
 
-# DROP, IF and EXISTS are keywords only in this statement. Existing unquoted
-# column and table names keep working, and quoted words stay identifiers.
+def command_word(+word: String) -> Bool:
+  String.eq(word, "DROP") || String.eq(word, "UPDATE") || String.eq(word, "DELETE")
+
+# Recognize command-specific words only where they introduce syntax. Quoted
+# words and existing unquoted identifiers elsewhere keep their names.
 def contextual(+word: String, acc: Tokens) -> Bool:
   match acc:
-    case Nil{}: String.eq(word, "DROP")
-    case Symbol{59} <> _: String.eq(word, "DROP")
+    case Nil{}: command_word(word)
+    case Symbol{59} <> _: command_word(word)
+    case Name{_} <> Keyword{"UPDATE"} <> _: String.eq(word, "SET")
     case Keyword{+last} <> Keyword{+previous} <> _:
       (String.eq(word, "IF") && String.eq(last, "TABLE") && String.eq(previous, "DROP")) || (String.eq(word, "EXISTS") && String.eq(last, "IF") && String.eq(previous, "TABLE"))
     case _: False{}

@@ -3,6 +3,7 @@ import ./sql_lexer.bend as L
 import ./sql_parse.bend as P
 import ./sql_values.bend as V
 import ./sql.bend as SQL
+import ./catalog_rows.bend as M
 import ./table.bend as T
 
 def Entries() -> Data:
@@ -69,16 +70,10 @@ def create(tokens: L.Tokens, +catalog: Catalog, temp: Bool, external: Entries) -
         add(catalog, name, table, temp)
     case _: L.error(Catalog, "expected CREATE TABLE name (...) or AS SELECT")
 
-def int32(+kind: String) -> Bool:
-  String.eq(kind, "INT") || String.eq(kind, "INTEGER")
-
-def check_value(+target: String, +source: String) -> Bool:
-  String.eq(source, "NULL") || String.eq(target, source) || (int32(source) && (int32(target) || String.eq(target, "BIGINT")))
-
 def compatible(cols: List<&2, T.Column>, row: V.Literals) -> Bool:
   match cols row:
     case Nil{} Nil{}: True{}
-    case Con{T.Column{_, t}, cs} Con{P.Lit{_, s, _}, vs}: check_value(t, s) && compatible(cs, vs)
+    case Con{T.Column{_, t}, cs} Con{P.Lit{_, s, _}, vs}: M.compatible_type(t, s) && compatible(cs, vs)
     case _ _: False{}
 
 def valid_rows(rows: V.Rows, +cols: List<&2, T.Column>) -> Bool:
@@ -94,52 +89,54 @@ def insert_rows(table: T.Table, +values: V.Rows) -> L.Checked(T.Table):
 def compatible_columns(target: List<&2, T.Column>, source: List<&2, T.Column>) -> Bool:
   match target source:
     case Nil{} Nil{}: True{}
-    case T.Column{_, t} <> ts T.Column{_, s} <> ss: check_value(t, s) && compatible_columns(ts, ss)
+    case T.Column{_, t} <> ts T.Column{_, s} <> ss: M.compatible_type(t, s) && compatible_columns(ts, ss)
     case _ _: False{}
 
 type Change is Data:
   AddValues{values: V.Rows}
   AddSelection{source: T.Table}
   Drop{}
-
-def changes_table(change: Change) -> Bool:
-  match change:
-    case AddSelection{T.Table{_, Nil{}}}: False{}
-    case _: True{}
+  ModifyRows{operation: M.Operation, condition: Maybe<&2, L.Tokens>}
 
 def append_rows(added: T.Rows, rows: T.Rows) -> T.Rows:
   match added:
     case Nil{}: rows
     case extra: List.append(&2, List<&2, T.Cell>, rows, extra)
 
-def change_table(change: Change, key: String, table: T.Table, tail: Entries) -> L.Checked(Entries):
-  match change:
-    case Drop{}: Done{tail}
-    case AddValues{values}:
-      do L.Checked<Entries>:
-        updated : T.Table <- insert_rows(table, values)
-        return SQL.Entry{key, updated} <> tail
-    case AddSelection{T.Table{source, extra}}:
-      T.Table{+cols, rows} = table
-      do L.Checked<Entries>:
-        _ : Unit <- P.expect(Unit, compatible_columns(cols, source), Unit{}, "SELECT columns disagree with target schema")
-        return SQL.Entry{key, T.Table{cols, append_rows(extra, rows)}} <> tail
+type Changed is Data:
+  Missing{}
+  Changed{entries: Entries, dirty: Bool}
 
-# None denotes a missing table. Some{Nil{}} is a successful drop of the last table.
-def Changed() -> Data:
-  Maybe<&2, Entries>
+def updated_entry(result: M.ResultRows, cols: List<&2, T.Column>, key: String, tail: Entries) -> Changed:
+  M.ResultRows{updated, dirty} = result
+  Changed{SQL.Entry{key, T.Table{cols, updated}} <> tail, dirty}
+
+def change_table(change: Change, key: String, table: T.Table, tail: Entries) -> L.Checked(Changed):
+  match change:
+    case Drop{}: Done{Changed{tail, True{}}}
+    case AddValues{values}:
+      do L.Checked<Changed>:
+        updated : T.Table <- insert_rows(table, values)
+        return Changed{SQL.Entry{key, updated} <> tail, True{}}
+    case AddSelection{T.Table{source, +extra}}:
+      T.Table{+cols, rows} = table
+      do L.Checked<Changed>:
+        _ : Unit <- P.expect(Unit, compatible_columns(cols, source), Unit{}, "SELECT columns disagree with target schema")
+        return Changed{SQL.Entry{key, T.Table{cols, append_rows(extra, rows)}} <> tail, Bool.not(List.is_empty(&2, M.Row, extra))}
+    case ModifyRows{op, condition}:
+      T.Table{+cols, rows} = table
+      do L.Checked<Changed>:
+        result : M.ResultRows <- M.apply(op, condition, cols, rows)
+        return updated_entry(result, cols, key, tail)
 
 def prepend(entry: SQL.Entry, change: Changed) -> Changed:
   match change:
-    case None{}: None{}
-    case Some{entries}: Some{entry <> entries}
+    case Missing{}: Missing{}
+    case Changed{entries, dirty}: Changed{entry <> entries, dirty}
 
 def change_entry(found: Bool, +key: String, +table: T.Table, +tail: Entries, change: Change, more: Change -> L.Checked(Changed)) -> L.Checked(Changed):
   match found:
-    case True{}:
-      do L.Checked<Changed>:
-        next : Entries <- change_table(change, key, table, tail)
-        return Some{next}
+    case True{}: change_table(change, key, table, tail)
     case False{}:
       do L.Checked<Changed>:
         result : Changed <- more(change)
@@ -147,7 +144,7 @@ def change_entry(found: Bool, +key: String, +table: T.Table, +tail: Entries, cha
 
 def change_entries(xs: Entries, +name: String, change: Change) -> L.Checked(Changed):
   match xs:
-    case Nil{}: Done{None{}}
+    case Nil{}: Done{Missing{}}
     case SQL.Entry{+key, table} <> +tail:
       change_entry(same(key, name), key, table, tail, change, op => change_entries(tail, name, op))
 
@@ -160,19 +157,19 @@ def modified(value: L.Checked(Catalog), dirty: Bool) -> L.Checked(Edit):
     c : Catalog <- value
     return Edit{c, dirty}
 
-def stored_change(result: Changed, original: Catalog, local: Entries, dirty: Bool, optional: Bool) -> L.Checked(Edit):
+def stored_change(result: Changed, original: Catalog, local: Entries, optional: Bool) -> L.Checked(Edit):
   match result optional:
-    case Some{entries} _: Done{Edit{Catalog{entries, local}, dirty}}
-    case None{} True{}: Done{Edit{original, False{}}}
-    case None{} False{}: L.error(Edit, "unknown table")
+    case Changed{entries, dirty} _: Done{Edit{Catalog{entries, local}, dirty}}
+    case Missing{} True{}: Done{Edit{original, False{}}}
+    case Missing{} False{}: L.error(Edit, "unknown table")
 
-def local_change(result: Changed, c: Catalog, name: String, +change: Change, optional: Bool) -> L.Checked(Edit):
+def local_change(result: Changed, c: Catalog, name: String, change: Change, optional: Bool) -> L.Checked(Edit):
   match result c:
-    case Some{entries} Catalog{stored, _}: Done{Edit{Catalog{stored, entries}, False{}}}
-    case None{} Catalog{+stored, +local}:
+    case Changed{entries, _} Catalog{stored, _}: Done{Edit{Catalog{stored, entries}, False{}}}
+    case Missing{} Catalog{+stored, +local}:
       do L.Checked<Edit>:
         result : Changed <- change_entries(stored, name, change)
-        stored_change(result, Catalog{stored, local}, local, changes_table(change), optional)
+        stored_change(result, Catalog{stored, local}, local, optional)
 
 def alter(c: Catalog, +name: String, +change: Change, optional: Bool) -> L.Checked(Edit):
   Catalog{stored, +local} = c
@@ -192,6 +189,18 @@ def drop_table(tokens: L.Tokens, c: Catalog) -> L.Checked(Edit):
     case L.Keyword{"IF"} <> L.Keyword{"EXISTS"} <> L.Name{name} <> Nil{}: alter(c, name, Drop{}, True{})
     case _: L.error(Edit, "expected DROP TABLE [IF EXISTS] name")
 
+def delete_rows(tokens: L.Tokens, c: Catalog) -> L.Checked(Edit):
+  match tokens:
+    case L.Name{name} <> Nil{}: alter(c, name, ModifyRows{M.Delete{}, None{}}, False{})
+    case L.Name{name} <> L.Keyword{"WHERE"} <> ts: alter(c, name, ModifyRows{M.Delete{}, Some{ts}}, False{})
+    case _: L.error(Edit, "expected DELETE FROM name [WHERE condition]")
+
+def update_rows(body: P.Split, name: String, c: Catalog) -> L.Checked(Edit):
+  P.BeforeAfter{assignments, has_where, ts} = body
+  op : M.Operation = M.Update{P.segments(assignments, Nil{}, Nil{})}
+  condition = Bool.pick(Maybe<&2, L.Tokens>, has_where, Some{ts}, None{})
+  alter(c, name, ModifyRows{op, condition}, False{})
+
 def execute(tokens: L.Tokens, +c: Catalog, external: Entries) -> L.Checked(Edit):
   match tokens:
     case L.Keyword{"CREATE"} <> L.Keyword{"TABLE"} <> t: modified(create(t, c, False{}, external), True{})
@@ -203,6 +212,8 @@ def execute(tokens: L.Tokens, +c: Catalog, external: Entries) -> L.Checked(Edit)
         source : T.Table <- SQL.raw_query_tokens(L.Keyword{"SELECT"} <> t, List.append(&2, SQL.Entry, external, visible(c)))
         alter(c, n, AddSelection{source}, False{})
     case L.Keyword{"DROP"} <> L.Keyword{"TABLE"} <> t: drop_table(t, c)
+    case L.Keyword{"DELETE"} <> L.Keyword{"FROM"} <> t: delete_rows(t, c)
+    case L.Keyword{"UPDATE"} <> L.Name{name} <> L.Keyword{"SET"} <> t: update_rows(P.split(t, L.Keyword{"WHERE"}), name, c)
     case L.Keyword{"SELECT"} <> t:
       do L.Checked<Edit>:
         _ : T.Table <- SQL.query_tokens(L.Keyword{"SELECT"} <> t, List.append(&2, SQL.Entry, external, visible(c)))

@@ -10,6 +10,11 @@ def Cells() -> Data:
 def Bools() -> Data:
   List<&2, Bool>
 
+# Views share the stream's list tails. Every decoder checks its descriptor's
+# length before consuming bytes, independently of any following buffer.
+type Buffer is Data:
+  Buffer{bytes: F.Bytes, length: U32}
+
 # The row count is bounded by the value buffer before any replicated flags
 # are allocated. A zero-length validity buffer represents an all-valid array.
 @unsafe def bits(n: U32, bs: F.Bytes, left: U32, +word: U32, acc: Bools) -> F.R(Bools):
@@ -26,15 +31,21 @@ def nulls(xs: Bools, acc: U32) -> U32:
     case False{} <> t: nulls(t, (acc + 1 : U32))
     case True{} <> t: nulls(t, acc)
 
-def validity(bs: F.Bytes, n: U32, expected: U32) -> F.R(Bools):
-  match bs:
-    case Nil{}:
+def bitmap(+n: U32, buf: Buffer) -> F.R(Bools):
+  Buffer{bs, length} = buf
+  do F.R<Bools>:
+    F.check(U32.is_le(((n + 7 : U32) / 8 : U32), length), "truncated bitmap")
+    bits(n, bs, 0, 0, Nil{})
+
+def validity(buf: Buffer, n: U32, expected: U32) -> F.R(Bools):
+  match buf:
+    case Buffer{_, 0}:
       do F.R<Bools>:
         F.check(U32.is_zero(expected), "missing validity bitmap")
         return List.replicate(Bool, U32.to_nat(n), True{})
-    case _:
+    case data:
       do F.R<Bools>:
-        +flags : Bools <- bits(n, bs, 0, 0, Nil{})
+        +flags : Bools <- bitmap(n, data)
         F.check(U32.is_eq(nulls(flags, 0), expected), "bitmap disagrees with null count")
         return flags
 
@@ -89,17 +100,17 @@ def boolean(flags: Bools, values: Bools) -> Cells:
     case False{} <> t _ <> u: T.Null{} <> boolean(t, u)
     case _ _: Nil{}
 
-def fixed_values(p: A.Physical, +n: U32, nulls: U32, validity_bytes: F.Bytes, +bs: F.Bytes) -> F.R(Cells):
-  match p:
-    case A.Bit{}:
+def fixed_values(p: A.Physical, +n: U32, nulls: U32, validity_bytes: Buffer, data: Buffer) -> F.R(Cells):
+  match p data:
+    case A.Bit{} buf:
       do F.R<Cells>:
-        values : Bools <- bits(n, bs, 0, 0, Nil{})
+        values : Bools <- bitmap(n, buf)
         flags : Bools <- validity(validity_bytes, n, nulls)
         return boolean(flags, values)
-    case +kind:
+    case +kind Buffer{bs, size}:
       +width = fixed_size(kind)
       do F.R<Cells>:
-        F.check(U32.is_le(n, (A.length(U32, bs) / width : U32)), "truncated primitive array")
+        F.check(U32.is_le(n, (size / width : U32)), "truncated primitive array")
         flags : Bools <- validity(validity_bytes, n, nulls)
         fixed(flags, kind, width, bs, Nil{})
 
@@ -112,26 +123,28 @@ def var_cell(text: Bool, valid: Bool, bs: F.Bytes) -> F.R(T.Cell):
         s : String <- UTF8.decode(bs)
         return T.Utf8{s}
 
-def variable(flags: Bools, +text: Bool, +offsets: F.Bytes, +start: U32, bs: F.Bytes, acc: Cells) -> F.R(Cells):
+def variable(flags: Bools, +text: Bool, +offsets: F.Bytes, +start: U32, bs: F.Bytes, +data_len: U32, acc: Cells) -> F.R(Cells):
   match flags:
     case Nil{}: Done{List.reverse(&2, T.Cell, acc)}
     case h <> t:
       do F.R<Cells>:
         +stop : U32 <- F.u32(offsets)
-        F.check(U32.is_ge(stop, start) && U32.is_le(stop, 2147483647), "invalid variable-width offset")
+        F.check(U32.is_ge(stop, start) && U32.is_le(stop, data_len), "invalid variable-width offset")
         +s : F.Span <- F.split(bs, (stop - start : U32))
         value : T.Cell <- var_cell(text, h, F.head(s))
         more : F.Bytes <- F.drop(offsets, 4)
-        variable(t, text, more, stop, F.tail(s), value <> acc)
+        variable(t, text, more, stop, F.tail(s), data_len, value <> acc)
 
-def var_values(text: Bool, +n: U32, nulls: U32, validity_bytes: F.Bytes, +offsets: F.Bytes, bs: F.Bytes) -> F.R(Cells):
+def var_values(text: Bool, +n: U32, nulls: U32, validity_bytes: Buffer, offsets: Buffer, data: Buffer) -> F.R(Cells):
   match n offsets:
-    case 0 Nil{}: Done{Nil{}}
-    case _ _:
+    case 0 Buffer{_, 0}: Done{Nil{}}
+    case _ Buffer{+bs, length}:
+      Buffer{payload, +data_len} = data
       do F.R<Cells>:
-        F.check(U32.is_lt(n, (A.length(U32, offsets) / 4 : U32)), "truncated variable-width offsets")
-        +start : U32 <- F.u32(offsets)
-        data : F.Bytes <- F.drop(bs, start)
-        rest : F.Bytes <- F.drop(offsets, 4)
+        F.check(U32.is_lt(n, (length / 4 : U32)), "truncated variable-width offsets")
+        +start : U32 <- F.u32(bs)
+        F.check(U32.is_le(start, data_len), "invalid variable-width offset")
+        values : F.Bytes <- F.drop(payload, start)
+        rest : F.Bytes <- F.drop(bs, 4)
         flags : Bools <- validity(validity_bytes, n, nulls)
-        variable(flags, text, rest, start, data, Nil{})
+        variable(flags, text, rest, start, values, data_len, Nil{})

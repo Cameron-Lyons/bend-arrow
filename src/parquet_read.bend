@@ -327,6 +327,27 @@ def decompress(codec: U32, expected: U32, +data: W.Bytes) -> W.R(W.Bytes):
 type Page is Data:
   Page{header: List<&2, W.Field>, uncompressed: U32, bytes: W.Bytes}
 
+# PageHeader.crc uses the reflected IEEE CRC-32 polynomial 0xEDB88320.
+# Hash the stored bytes before decompressing or separating V2 levels.
+def crc_bit(+v: U32) -> U32:
+  U32.xor((v >> 1n : U32), ((0 - (v .&. 1)) .&. 3988292384 : U32))
+
+def crc_nibble(v: U32) -> U32:
+  crc_bit(crc_bit(crc_bit(crc_bit(v))))
+
+def crc32(bytes: W.Bytes, crc: U32) -> U32:
+  match bytes:
+    case Nil{}: U32.xor(crc, 4294967295)
+    case b <> tail: crc32(tail, crc_nibble(crc_nibble(U32.xor(crc, b))))
+
+def verify_crc(field: Maybe<&2, W.Value>, bytes: W.Bytes) -> W.R(Unit):
+  match field:
+    case None{}: Done{Unit{}}
+    case Some{v}:
+      do W.R<Unit>:
+        expected : U32 <- W.as_int(v)
+        W.check(U32.is_eq(expected, crc32(bytes, 4294967295)), "page checksum mismatch")
+
 def page() -> W.P(Page):
   do W.P<Page>:
     h : W.Value <- W.fields(64, 0, Nil{})
@@ -334,7 +355,8 @@ def page() -> W.P(Page):
     +uncompressed : U32 <- W.lift(U32, W.number(fs, 2))
     size : U32 <- W.lift(U32, W.number(fs, 3))
     W.lift(Unit, W.check(U32.is_lt(uncompressed, 2147483648), "invalid uncompressed page size"))
-    bytes : W.Bytes <- W.take(size)
+    +bytes : W.Bytes <- W.take(size)
+    W.lift(Unit, verify_crc(W.lookup(fs, 4), bytes))
     return Page{fs, uncompressed, bytes}
 
 def compressed_flag(v: Maybe<&2, W.Value>) -> W.R(Bool):

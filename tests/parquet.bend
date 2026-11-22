@@ -112,12 +112,56 @@ def test_v2() -> IO(Unit):
     expect(failed(T.Table, Reader.decode(change_byte(v2, 16, 2))), "an inconsistent V2 row count was accepted")
     expect(failed(T.Table, Reader.decode(change_byte(v2, 22, 2))), "flat V2 repetition levels were accepted")
 
+def checksum_error(result: Files.Outcome(T.Table)) -> Bool:
+  match result:
+    case Fail{(22, message)}: String.eq(message, "Parquet: page checksum mismatch")
+    case _: False{}
+
+def checksum_rows(table: T.Table) -> Bool:
+  match table:
+    case T.Table{_, (T.Signed{0, 17} <> T.Utf8{"apricot"} <> Nil{}) <> (T.Null{} <> T.Utf8{"plum"} <> Nil{}) <> (T.Signed{4294967295, 4294967294} <> T.Utf8{"apricot"} <> Nil{}) <> Nil{}}: True{}
+    case _: False{}
+
+# PyArrow 26.0.1, Snappy, V2, write_page_checksum=True. Each mutation
+# changes a value without changing its encoded size or the number of rows.
+def test_checksums() -> IO(Unit):
+  do IO<Unit>:
+    +raw : Files.Bytes <- IO.try(Files.Bytes, Files.read("tests/fixtures/page-checksums.parquet"))
+    t : T.Table <- IO.try(T.Table, IO.pure(Files.Outcome(T.Table), Reader.decode(raw)))
+    expect(checksum_rows(t), "checksummed pages changed values")
+    expect(checksum_error(Reader.decode(change_byte(raw, 36, 18))), "corrupt PLAIN value passed its checksum")
+    expect(checksum_error(Reader.decode(change_byte(raw, 70, 65))), "corrupt Snappy dictionary passed its checksum")
+    expect(checksum_error(Reader.decode(change_byte(raw, 119, 3))), "corrupt dictionary IDs passed their checksum")
+
+def ascending(n: Nat, +first: U32) -> Files.Bytes:
+  match n:
+    case 0n: Nil{}
+    case 1n+p: first <> ascending(p, U32.inc(first))
+
+def same_bytes(xs: Files.Bytes, ys: Files.Bytes) -> Bool:
+  match xs ys:
+    case Nil{} Nil{}: True{}
+    case x <> xt y <> yt: U32.is_eq(x, y) && same_bytes(xt, yt)
+    case _ _: False{}
+
+def test_snappy() -> IO(Unit):
+  # A 128-byte literal, two long-distance copies spanning checkpoints, and
+  # two overlapping copies. The commands use all three Snappy offset widths.
+  +prefix = ascending(128n, 0)
+  input = List.concat(&2, U32, [[137, 2, 240, 127], prefix, [246, 128, 0, 255, 128, 0, 0, 0, 13, 2, 1, 1]])
+  expected = List.concat(&2, U32, [prefix, ascending(126n, 0), [124, 125, 124, 125, 124, 125, 124, 124, 124, 124, 124]])
+  do IO<Unit>:
+    output : Files.Bytes <- IO.try(Files.Bytes, IO.pure(Files.Outcome(Files.Bytes), Snappy.decode(265, input)))
+    expect(same_bytes(output, expected), "Snappy copy changed bytes across checkpoints or overlaps")
+
 def main() -> IO(Unit):
   do IO<Unit>:
     +bytes : Files.Bytes <- IO.try(Files.Bytes, Files.read("tests/fixtures/flat-snappy.parquet"))
     table : T.Table <- IO.try(T.Table, IO.pure(Files.Outcome(T.Table), Reader.decode(bytes)))
     expect(check_rows(table), "Snappy dictionary values, validity, or row-group order changed")
     test_v2()
+    test_checksums()
+    test_snappy()
     raw : Files.Bytes <- IO.try(Files.Bytes, Files.read("tests/fixtures/primitive-types.parquet"))
     typed : T.Table <- IO.try(T.Table, IO.pure(Files.Outcome(T.Table), Reader.decode(raw)))
     expect(primitive_table(typed), "numeric widths, floating-point words or packed booleans changed")
