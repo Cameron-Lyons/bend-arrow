@@ -69,6 +69,8 @@ Arrow interchange uses the little-endian, uncompressed V5 IPC **stream** format.
 
 `make test` runs the Bend SQL, connection, transaction, Parquet, and IPC tests and the round-trip example. Tests read checked-in binary fixtures produced by PyArrow and the earlier DuckDB-backed example, so running them requires only the Bend toolchain and Make.
 
+GitHub Actions runs the same target with Clang 23 on Ubuntu 26.04 for every pull request and push to `main`.
+
 ## License
 
 [MIT](LICENSE). Historical third-party acknowledgements are in [licenses/NOTICE](licenses/NOTICE).
