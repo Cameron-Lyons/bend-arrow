@@ -68,9 +68,11 @@ A Bend-created stream retains its source connection through release. It can be i
 
 See the [Arrow C Data specification](https://arrow.apache.org/docs/format/CDataInterface.html) and the [Arrow C Stream specification](https://arrow.apache.org/docs/format/CStreamInterface.html).
 
+DuckDB 1.5.6 can read nulls from the wrong positions in lists of dictionary-encoded elements. Decode the element dictionaries before importing sliced or deeply nested lists with nullable indices. For top-level `LIST` and `LARGE_LIST` columns, the bridge returns `EINVAL` when it detects a mismatched window.
+
 ## Verification
 
-`make test` builds and runs the native Arrow tests, Bend integration tests, and Parquet example. To exercise the C ABI against an independent Arrow implementation, run the optional test in a Python environment with PyArrow installed.
+`make test` checks Arrow imports and exports, concurrent stream transfers and database opens, the Bend bindings, and the Parquet example. To exercise the C ABI against an independent Arrow implementation, run the optional test in a Python environment with PyArrow installed.
 
 ```sh
 make test-pyarrow PYTHON=/path/to/venv/bin/python

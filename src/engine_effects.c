@@ -27,7 +27,7 @@ static Term bd_effect_close(Env e, Term *args, IoWork *work) {
 struct bd_column_data {
     duckdb_type type;
     void *values;
-    uint64_t *validity;
+    const uint64_t *validity;
 };
 
 static const char *bd_sql_type(duckdb_type t) {
@@ -66,7 +66,7 @@ static Term bd_wide_words(Env e, u64 tag, uint64_t upper, uint64_t lower) {
 }
 
 static Term bd_cell(Env e, const struct bd_column_data *column, idx_t row) {
-    if (column->validity && !duckdb_validity_row_is_valid(column->validity, row)) {
+    if (column->validity && !(column->validity[row / 64] & (UINT64_C(1) << (row % 64)))) {
         return term_pak(CID(Null), 0);
     }
     void *values = column->values;
@@ -120,18 +120,29 @@ static Term bd_table(Env e, duckdb_result *result) {
     Term columns = nil;
     for (idx_t i = count; i > 0; --i) {
         idx_t col = i - 1;
-        data[col].type = duckdb_column_type(result, col);
+        duckdb_logical_type logical = duckdb_column_logical_type(result, col);
+        if (!logical) {
+            term_drop(e, columns);
+            free(data);
+            return io_fail(e, ENOMEM, NULL);
+        }
+        data[col].type = duckdb_get_type_id(logical);
         const char *type = bd_sql_type(data[col].type);
         const char *name = duckdb_column_name(result, col);
         if (!type) {
             char message[384];
             snprintf(message, sizeof message, "Column '%.220s' has an unsupported Bend cell type. Use Arrow.query or an explicit SQL cast.", name);
+            duckdb_destroy_logical_type(&logical);
             term_drop(e, columns);
             free(data);
             return io_fail(e, ENOTSUP, message);
         }
+        char *alias = duckdb_logical_type_get_alias(logical);
+        duckdb_destroy_logical_type(&logical);
+        if (alias) type = alias;
         Term field = io_node(e, CID(Column), io_str(e, name, strlen(name)),
-                            io_str(e, type, strlen(type)));
+                             io_str(e, type, strlen(type)));
+        duckdb_free(alias);
         columns = io_node(e, CID(Con), field, columns);
     }
 

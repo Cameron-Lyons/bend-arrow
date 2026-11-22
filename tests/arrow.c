@@ -75,7 +75,7 @@ static int test_schema(struct ArrowArrayStream *s, struct ArrowSchema *out) {
 }
 static int broken_next(struct ArrowArrayStream *s, struct ArrowArray *out) {
     TestProducer *p = s->private_data;
-    if (p->yielded++ == 1) return EIO;
+    if (p->yielded++ == 1) return ECANCELED;
     return p->source.get_next(&p->source, out);
 }
 static int sliced_next(struct ArrowArrayStream *s, struct ArrowArray *out) {
@@ -85,6 +85,16 @@ static int sliced_next(struct ArrowArrayStream *s, struct ArrowArray *out) {
         out->offset = 3;
         out->length = 4;
     }
+    return rc;
+}
+static void omit_dictionary_counts(struct ArrowArray *array) {
+    if (array->dictionary) array->null_count = -1;
+    for (int64_t i = 0; i < array->n_children; i++) omit_dictionary_counts(array->children[i]);
+}
+static int unknown_count_next(struct ArrowArrayStream *s, struct ArrowArray *out) {
+    TestProducer *p = s->private_data;
+    int rc = p->source.get_next(&p->source, out);
+    if (!rc && out->release) omit_dictionary_counts(out);
     return rc;
 }
 static const char *broken_error(struct ArrowArrayStream *s) { (void)s; return "source stopped"; }
@@ -123,10 +133,42 @@ static void check_imports(duckdb_connection con) {
     sliced.release(&sliced);
     CHECK(scalar(con, "SELECT sum(i) FROM sliced") == 18);
 
+    const char *enums = "SELECT CASE WHEN i%2=0 THEN 'a'::ENUM('a','b') END AS e FROM range(17) t(i)";
+    TestProducer sliced_enum = {.source = query(con, enums)};
+    struct ArrowArrayStream enum_window = {test_schema, sliced_next, broken_error, test_release, &sliced_enum};
+    import(con, "sliced_enums", &enum_window);
+    enum_window.release(&enum_window);
+    CHECK(scalar(con, "SELECT count(e) FROM sliced_enums") == 2);
+
+    const char *nested_enums = "SELECT e, {'f': e} AS s, [e] AS xs FROM "
+                               "(SELECT CASE WHEN i%2=0 THEN 'a'::ENUM('a','b') END AS e FROM range(17) t(i))";
+    TestProducer unknown = {.source = query(con, nested_enums)};
+    struct ArrowArrayStream dictionary = {test_schema, unknown_count_next, broken_error, test_release, &unknown};
+    import(con, "nullable_enums", &dictionary);
+    dictionary.release(&dictionary);
+    CHECK(scalar(con, "SELECT count(e) FROM nullable_enums") == 9);
+    CHECK(scalar(con, "SELECT count(s.f) FROM nullable_enums") == 9);
+    CHECK(scalar(con, "SELECT count(xs[1]) FROM nullable_enums") == 9);
+
+    TestProducer nested_window = {.source = query(con, nested_enums)};
+    struct ArrowArrayStream list_window = {test_schema, sliced_next, broken_error, test_release, &nested_window};
+    CHECK(bd_arrow_import(con, "sliced_lists", &list_window, &error) == EINVAL);
+    CHECK(error && strstr(error, "dictionary nulls"));
+    free(error);
+    list_window.release(&list_window);
+    CHECK(!scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name='sliced_lists'"));
+
+    TestProducer aligned = {.source = query(con, "SELECT [CASE WHEN i%3=0 THEN 'a'::ENUM('a','b') END] AS xs "
+                                                 "FROM range(17) t(i)")};
+    struct ArrowArrayStream aligned_window = {test_schema, sliced_next, broken_error, test_release, &aligned};
+    import(con, "aligned_lists", &aligned_window);
+    aligned_window.release(&aligned_window);
+    CHECK(scalar(con, "SELECT count(xs[1]) FROM aligned_lists") == 2);
+
     CHECK(!duckdb_query(con, "CREATE TABLE marker(n INT); BEGIN; INSERT INTO marker VALUES (5)", NULL));
     TestProducer bad = {.source = query(con, sql)};
     struct ArrowArrayStream broken = {test_schema, broken_next, broken_error, test_release, &bad};
-    CHECK(bd_arrow_import(con, "incomplete", &broken, &error));
+    CHECK(bd_arrow_import(con, "incomplete", &broken, &error) == ECANCELED);
     CHECK(error && strstr(error, "source stopped"));
     free(error);
     broken.release(&broken);

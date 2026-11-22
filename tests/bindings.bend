@@ -25,6 +25,12 @@ def empty(table: DB.Table) -> Bool:
       String.eq(name, "amount") && String.eq(sql_type, "BIGINT")
     case _: False{}
 
+def json_column(table: DB.Table) -> Bool:
+  match table:
+    case DB.Table{DB.Column{_, t} <> Nil{}, (DB.Utf8{value} <> Nil{}) <> Nil{}}:
+      String.eq(t, "JSON") && String.eq(value, "[42]")
+    case _: False{}
+
 def values(table: DB.Table) -> Bool:
   match table:
     case DB.Table{_, (DB.Null{} <> DB.Boolean{True{}} <> DB.Signed{4294967295, 4294967294} <> DB.Unsigned{4294967295, 4294967295} <> DB.Float{f} <> DB.Double{1073217536, 0} <> DB.Utf8{s} <> DB.Bytes{0 <> 255 <> Nil{}} <> Nil{}) <> Nil{}}:
@@ -37,11 +43,17 @@ def wide_values(table: DB.Table) -> Bool:
       True{}
     case _: False{}
 
+def valid_marker(marker: DB.Cell, row: U32) -> Bool:
+  match marker:
+    case DB.Null{}: U32.is_eq((row % 64 : U32), 63)
+    case DB.Signed{0, +n}: U32.is_eq(n, row) && U32.is_ne((n % 64 : U32), 63)
+    case _: False{}
+
 def in_order(rows: List<&2, List<&2, DB.Cell>>, +expected: U32) -> Bool:
   match rows:
     case Nil{}: U32.is_eq(expected, 5000)
-    case (DB.Signed{0, value} <> Nil{}) <> rest:
-      U32.is_eq(value, expected) && in_order(rest, (expected + 1 : U32))
+    case (DB.Signed{0, value} <> marker <> Nil{}) <> rest:
+      U32.is_eq(value, expected) && valid_marker(marker, expected) && in_order(rest, (expected + 1 : U32))
     case _: False{}
 
 def check_order(table: DB.Table) -> Bool:
@@ -52,6 +64,9 @@ def main() -> IO(Unit):
   do IO<Unit>:
     +src : DB.Connection <- IO.try(DB.Connection, DB.memory())
     +dst : DB.Connection <- IO.try(DB.Connection, DB.memory())
+    json : DB.Table <- IO.try(DB.Table, DB.query(src, "SELECT '[42]'::JSON"))
+    expect(json_column(json), "JSON column lost its SQL type or value")
+    expect(String.eq(Parquet.path_literal("'a''β'"), "'''a''''β'''"), "incorrect SQL path quoting")
     table : DB.Table <- IO.try(DB.Table, DB.query(src, "SELECT NULL::INTEGER, true, -2::BIGINT, 18446744073709551615::UBIGINT, 2.5::FLOAT, 1.5::DOUBLE, 'Bénd' || chr(0) || '!', from_hex('00ff')"))
     expect(values(table), "Bend cells lost type, precision or bytes")
     empty_table : DB.Table <- IO.try(DB.Table, DB.query(src, "SELECT 0::BIGINT AS amount WHERE false"))
@@ -60,8 +75,8 @@ def main() -> IO(Unit):
     expect(wide_values(wide), "128-bit integer words changed")
     unsupported : Result<&1, &1, (U32 & String), DB.Table> <- DB.query(src, "SELECT current_date, 42")
     expect(failed(DB.Table, unsupported), "unsupported scalar type was accepted")
-    ordered : DB.Table <- IO.try(DB.Table, DB.query(src, "SELECT i FROM range(5000) t(i) ORDER BY i"))
-    expect(check_order(ordered), "Bend row order changed at a chunk boundary")
+    ordered : DB.Table <- IO.try(DB.Table, DB.query(src, "SELECT i, CASE WHEN i%64<>63 THEN i END FROM range(5000) t(i) ORDER BY i"))
+    expect(check_order(ordered), "row order or null validity changed across a chunk")
     invalid : Result<&1, &1, (U32 & String), DB.Table> <- DB.query(src, "SELECT missing_column")
     expect(failed(DB.Table, invalid), "expected a SQL error")
     missing : Result<&1, &1, (U32 & String), DB.Table> <- Parquet.read(src, "missing/unknown.parquet")

@@ -4,8 +4,14 @@ import ./arrow.bend as Arrow
 
 # Double single quotes inside a DuckDB string literal. Backslashes and UTF-8
 # characters retain their ordinary meaning in a standard SQL string literal.
+def path_literal.tail(path: String) -> String:
+  match path:
+    case SNil{}: "'"
+    case SCon{Chr{39}, t}: SCon{Chr{39}, SCon{Chr{39}, path_literal.tail(t)}}
+    case SCon{c, t}: SCon{c, path_literal.tail(t)}
+
 def path_literal(path: String) -> String:
-  "'" ++ String.join(String.split(path, Chr{39}), "''") ++ "'"
+  SCon{Chr{39}, path_literal.tail(path)}
 
 # A table expression for use after FROM. DuckDB also accepts glob patterns.
 def scan(path: String) -> String:
