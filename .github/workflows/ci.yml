@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Native tests
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Clang 23
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -fsSL --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key -o llvm.asc
+          echo '8b2a587ffd672c4687e7581dad4b2f6c1bb2ad6b480cd9771ba2ff48e0b8c75d  llvm.asc' | sha256sum --check --strict
+          sudo install -m 0644 llvm.asc /etc/apt/keyrings/llvm.asc
+          echo 'deb [signed-by=/etc/apt/keyrings/llvm.asc] https://apt.llvm.org/resolute/ llvm-toolchain-resolute-23 main' \
+            | sudo tee /etc/apt/sources.list.d/llvm-23.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-23
+          clang-23 --version
+
+      - name: Install Bend
+        working-directory: ${{ runner.temp }}
+        env:
+          BEND_VERSION: '2.0.40'
+          BEND_SHA256: c9ff8d67bd903fb6ad9a26b43d8a62c01021de82a44d55ce4a3dcd4732113d6b
+        run: |
+          archive="bend-${BEND_VERSION}-linux-x64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
+            "https://github.com/bendlang/bend/releases/download/v${BEND_VERSION}/$archive"
+          echo "$BEND_SHA256  $archive" | sha256sum --check --strict
+          tar -xzf "$archive"
+          echo "$PWD/bend/bin" >> "$GITHUB_PATH"
+
+      - name: Build and test
+        env:
+          CC: clang-23
+          BEND_NO_TELEMETRY: '1'
+        run: make -j2 test
