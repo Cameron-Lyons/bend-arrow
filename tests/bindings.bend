@@ -51,10 +51,37 @@ def check_batches(step: Arrow.Step) -> IO(Unit):
         expect(batch_size(batch, 2048), "wrong first batch size")
         after_first(Arrow.next(rest))
 
+def rejects(db: DB.Connection, table: T.Table) -> IO(Unit):
+  do IO<Unit>:
+    r : Result<&1, &1, U32 & String, Unit> <- DB.register(db, "checked", table)
+    expect(failed(Unit, r), "registered a table that disagrees with its schema")
+
+def one_cell(kind: String, value: T.Cell) -> T.Table:
+  T.Table{[T.Column{"v", kind}], [[value]]}
+
+def registration(+db: DB.Connection) -> IO(Unit):
+  do IO<Unit>:
+    rejects(db, T.Table{[T.Column{"n", "INTEGER"}], [Nil{}]})
+    rejects(db, T.Table{Nil{}, [[T.Null{}]]})
+    rejects(db, one_cell("BIGINT", T.Boolean{True{}}))
+    rejects(db, one_cell("TINYINT", T.Signed{0, 128}))
+    rejects(db, one_cell("SMALLINT", T.Signed{4294967295, 4294934527}))
+    rejects(db, one_cell("UINTEGER", T.Unsigned{1, 0}))
+    rejects(db, one_cell("BLOB", T.Bytes{[0, 256]}))
+    rejects(db, one_cell("VARCHAR", T.Utf8{SCon{Chr{55296}, ""}}))
+    rejects(db, T.Table{[T.Column{"x", "unknown"}], Nil{}})
+    rejects(db, one_cell("HUGEINT", T.WideUnsigned{0, 0, 0, 1}))
+    IO.try(Unit, DB.register(db, "checked", T.Table{
+      [T.Column{"wide", "HUGEINT"}, T.Column{"wide", "UHUGEINT"}, T.Column{"", "NULL"}, T.Column{"v", "TINYINT"}],
+      [[T.WideSigned{4294967295, 4294967295, 4294967295, 4294967295}, T.WideUnsigned{1, 2, 3, 4}, T.Null{}, T.Signed{4294967295, 4294967168}]]}))
+    t : T.Table <- IO.try(T.Table, DB.query(db, "SELECT count(*) FROM checked"))
+    expect(scalar(t, 1), "valid registration after a rejected table lost rows")
+
 def main() -> IO(Unit):
   do IO<Unit>:
     +src : DB.Connection <- IO.try(DB.Connection, DB.memory())
     +dst : DB.Connection <- IO.try(DB.Connection, DB.memory())
+    registration(src)
     expect(String.eq(Parquet.path_literal("'a''β'"), "'''a''''β'''"), "incorrect SQL path quoting")
     empty_table : T.Table <- IO.try(T.Table, DB.query(src, "SELECT 0::BIGINT AS amount WHERE false"))
     expect(empty(empty_table), "empty result lost its schema")

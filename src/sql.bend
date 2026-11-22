@@ -105,8 +105,18 @@ def trim_end(reversed: L.Tokens) -> L.Tokens:
     case L.Symbol{59} <> t: List.reverse(&2, L.Token, t)
     case ts: List.reverse(&2, L.Token, ts)
 
-def query_tokens(tokens: L.Tokens, tables: List<&2, Entry>) -> L.Checked(T.Table):
+# INSERT SELECT resolves untyped NULL columns against its target schema.
+def raw_query_tokens(tokens: L.Tokens, tables: List<&2, Entry>) -> L.Checked(T.Table):
   statement(trim_end(List.reverse(&2, L.Token, tokens)), tables)
+
+def result_types(table: T.Table) -> T.Table:
+  T.Table{cols, rows} = table
+  T.Table{V.finish(cols), rows}
+
+def query_tokens(tokens: L.Tokens, tables: List<&2, Entry>) -> L.Checked(T.Table):
+  do L.Checked<T.Table>:
+    table : T.Table <- raw_query_tokens(tokens, tables)
+    return result_types(table)
 
 def query(sql: String, tables: List<&2, Entry>) -> L.Checked(T.Table):
   do L.Checked<T.Table>:

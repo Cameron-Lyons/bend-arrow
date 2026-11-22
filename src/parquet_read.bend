@@ -3,7 +3,8 @@ import ./parquet_wire.bend as W
 import ./table.bend as T
 import ./utf8.bend as UTF8
 import ./parquet_hybrid.bend as Hybrid
-import ./parquet_index.bend as Index
+import ./random_access_list.bend as Index
+import ./byte_index.bend as B
 import ./parquet_snappy.bend as Snappy
 
 def Rows() -> Data:
@@ -204,20 +205,6 @@ def complete(-A: Type, pair: W.Bytes & A) -> W.R(A):
     W.check(W.empty(U32, trailing), "trailing bytes in a sized section")
     return x
 
-type DataInfo is Data:
-  DataInfo{count: U32, encoding: U32}
-
-def data_header(h: List<&2, W.Field>, left: U32, optional: Bool) -> W.R(DataInfo):
-  do W.R<DataInfo>:
-    v : W.Value <- W.get(h, 5)
-    +dh : List<&2, W.Field> <- W.as_fields(v)
-    +n : U32 <- W.number(dh, 1)
-    enc : U32 <- W.number(dh, 2)
-    lev : U32 <- W.number(dh, 3)
-    W.check(Bool.not(optional) || U32.is_eq(lev, 3), "only RLE definition levels are supported")
-    W.check(U32.is_le(n, left), "page count exceeds column count")
-    return DataInfo{n, enc}
-
 def dictionary_index(reversed: List<&2, T.Cell>, index: Index.Index(T.Cell)) -> Index.Index(T.Cell):
   match reversed:
     case Nil{}: index
@@ -258,58 +245,75 @@ def fill(bits: W.Bytes, cells: List<&2, T.Cell>, acc: List<&2, T.Cell>) -> W.R(L
     case Nil{} Nil{}: Done{acc}
     case 0 <> t vs: fill(t, vs, T.Null{} <> acc)
     case 1 <> t v <> vs: fill(t, vs, v <> acc)
-    case _ _: W.fail(List<&2, T.Cell>, "dictionary IDs differ from defined value count")
-
-def plain_payload(optional: Bool, n: U32, p: U32, tag: U32, acc: List<&2, T.Cell>) -> W.P(List<&2, T.Cell>):
-  match optional:
-    case False{}:
-      do W.P<List<&2, T.Cell>>:
-        reversed : List<&2, T.Cell> <- required_values(n, p, tag)
-        return List.append(&2, T.Cell, reversed, acc)
-    case True{}:
-      do W.P<List<&2, T.Cell>>:
-        size : U32 <- W.le32
-        encoded : W.Bytes <- W.take(size)
-        +bits : W.Bytes <- W.lift(W.Bytes, Hybrid.decode(n, 1, encoded))
-        reversed : List<&2, T.Cell> <- required_values(present(bits, 0), p, tag)
-        W.lift(List<&2, T.Cell>, fill(bits, List.reverse(&2, T.Cell, reversed), acc))
-
-def dict_payload(optional: Bool, n: U32, dict: Index.Index(T.Cell), bytes: W.Bytes, acc: List<&2, T.Cell>) -> W.R(List<&2, T.Cell>):
-  match optional:
-    case False{}:
-      do W.R<List<&2, T.Cell>>:
-        cells : List<&2, T.Cell> <- dictionary_values(n, dict, bytes)
-        return List.reverse.go(&2, T.Cell, cells, acc)
-    case True{}:
-      do W.R<List<&2, T.Cell>>:
-        +step : W.Step<U32> <- W.step(U32, W.le32(bytes))
-        +section : W.Step<W.Bytes> <- W.step(W.Bytes, W.take(W.parsed(U32, step), W.rest(U32, step)))
-        +bits : W.Bytes <- Hybrid.decode(n, 1, W.parsed(W.Bytes, section))
-        cells : List<&2, T.Cell> <- dictionary_values(present(bits, 0), dict, W.rest(W.Bytes, section))
-        fill(bits, cells, acc)
+    case _ _: W.fail(List<&2, T.Cell>, "decoded values differ from definition levels")
 
 type Dictionary is Data:
   NoDict{}
   Dict{values: Index.Index(T.Cell)}
 
-def dict_page(n: U32, optional: Bool, dict: Dictionary, bytes: W.Bytes, acc: List<&2, T.Cell>) -> W.R(List<&2, T.Cell>):
+def dict_cells(n: U32, dict: Dictionary, bytes: W.Bytes) -> W.R(List<&2, T.Cell>):
   match dict:
     case NoDict{}: W.fail(List<&2, T.Cell>, "dictionary-encoded data without a dictionary")
-    case Dict{index}: dict_payload(optional, n, index, bytes, acc)
+    case Dict{index}: dictionary_values(n, index, bytes)
 
-def read_data(info: DataInfo, leaf: Leaf, dict: Dictionary, bytes: W.Bytes, acc: List<&2, T.Cell>) -> W.R(List<&2, T.Cell>):
-  match info leaf:
-    case DataInfo{n, 0} Leaf{_, p, tag, _, optional}:
+# Boolean values encoded with RLE carry their own length prefix in both page versions.
+def boolean_cells(n: U32, physical: U32, bytes: W.Bytes) -> W.R(List<&2, T.Cell>):
+  do W.R<List<&2, T.Cell>>:
+    W.check(U32.is_zero(physical), "RLE value encoding requires a boolean column")
+    +s : W.Step<U32> <- W.step(U32, W.le32(bytes))
+    part : W.Bytes & W.Bytes <- W.take(W.parsed(U32, s), W.rest(U32, s))
+    encoded : W.Bytes <- complete(W.Bytes, part)
+    bits : W.Bytes <- Hybrid.decode(n, 1, encoded)
+    return bool_cells(bits)
+
+def page_values(enc: U32, n: U32, p: U32, tag: U32, dict: Dictionary, data: W.Bytes) -> W.R(List<&2, T.Cell>):
+  match enc:
+    case 0:
       do W.R<List<&2, T.Cell>>:
-        decoded : W.Bytes & List<&2, T.Cell> <- plain_payload(optional, n, p, tag, acc, bytes)
-        complete(List<&2, T.Cell>, decoded)
-    case DataInfo{n, 2} Leaf{_, _, _, _, optional}: dict_page(n, optional, dict, bytes, acc)
-    case DataInfo{n, 8} Leaf{_, _, _, _, optional}: dict_page(n, optional, dict, bytes, acc)
-    case _ _: W.fail(List<&2, T.Cell>, "unsupported data page encoding")
+        parsed : W.Bytes & List<&2, T.Cell> <- required_values(n, p, tag, data)
+        reversed : List<&2, T.Cell> <- complete(List<&2, T.Cell>, parsed)
+        return List.reverse(&2, T.Cell, reversed)
+    case 2: dict_cells(n, dict, data)
+    case 3: boolean_cells(n, p, data)
+    case 8: dict_cells(n, dict, data)
+    case _: W.fail(List<&2, T.Cell>, "unsupported data page encoding")
 
-def data_count(info: DataInfo) -> U32:
-  DataInfo{n, _} = info
-  n
+type Levels is Data:
+  Required{count: U32}
+  Optional{count: U32, bits: W.Bytes}
+
+def present_count(levels: Levels) -> U32:
+  match levels:
+    case Required{n}: n
+    case Optional{n, _}: n
+
+def add_values(levels: Levels, cells: List<&2, T.Cell>, acc: List<&2, T.Cell>) -> W.R(List<&2, T.Cell>):
+  match levels:
+    case Required{_}: Done{List.reverse.go(&2, T.Cell, cells, acc)}
+    case Optional{_, bits}: fill(bits, cells, acc)
+
+def levels(optional: Bool, n: U32, size: U32) -> W.P(Levels):
+  match optional:
+    case False{}:
+      do W.P<Levels>:
+        W.lift(Unit, W.check(U32.is_zero(size), "required column has definition levels"))
+        return Required{n}
+    case True{}:
+      do W.P<Levels>:
+        bytes : W.Bytes <- W.take(size)
+        +bits : W.Bytes <- W.lift(W.Bytes, Hybrid.decode(n, 1, bytes))
+        return Optional{present(bits, 0), bits}
+
+def v1_levels(optional: Bool, n: U32) -> W.P(Levels):
+  match optional:
+    case False{}: W.P.pure(Levels, Required{n})
+    case True{}:
+      do W.P<Levels>:
+        size : U32 <- W.le32
+        levels(True{}, n, size)
+
+type Payload is Data:
+  Payload{count: U32, encoding: U32, levels: Levels, bytes: W.Bytes}
 
 def decompress(codec: U32, expected: U32, +data: W.Bytes) -> W.R(W.Bytes):
   match codec:
@@ -321,24 +325,67 @@ def decompress(codec: U32, expected: U32, +data: W.Bytes) -> W.R(W.Bytes):
     case _: W.fail(W.Bytes, "unsupported Parquet compression codec")
 
 type Page is Data:
-  Page{header: List<&2, W.Field>, bytes: W.Bytes}
+  Page{header: List<&2, W.Field>, uncompressed: U32, bytes: W.Bytes}
 
-def page(codec: U32) -> W.P(Page):
+def page() -> W.P(Page):
   do W.P<Page>:
     h : W.Value <- W.fields(64, 0, Nil{})
     +fs : List<&2, W.Field> <- W.lift(List<&2, W.Field>, W.as_fields(h))
-    uncompressed : U32 <- W.lift(U32, W.number(fs, 2))
+    +uncompressed : U32 <- W.lift(U32, W.number(fs, 2))
     size : U32 <- W.lift(U32, W.number(fs, 3))
+    W.lift(Unit, W.check(U32.is_lt(uncompressed, 2147483648), "invalid uncompressed page size"))
     bytes : W.Bytes <- W.take(size)
-    data : W.Bytes <- W.lift(W.Bytes, decompress(codec, uncompressed, bytes))
-    return Page{fs, data}
+    return Page{fs, uncompressed, bytes}
 
-def dictionary(page: Page, leaf: Leaf) -> W.R(Dictionary):
-  Page{+h, bytes} = page
+def compressed_flag(v: Maybe<&2, W.Value>) -> W.R(Bool):
+  match v:
+    case None{}: Done{True{}}
+    case Some{W.Flag{flag}}: Done{flag}
+    case _: W.fail(Bool, "invalid is_compressed flag")
+
+def payload(tag: U32, h: List<&2, W.Field>, +left: U32, +optional: Bool, codec: U32, +size: U32, bytes: W.Bytes) -> W.R(Payload):
+  match tag:
+    case 0:
+      do W.R<Payload>:
+        v : W.Value <- W.get(h, 5)
+        +dh : List<&2, W.Field> <- W.as_fields(v)
+        +n : U32 <- W.number(dh, 1)
+        enc : U32 <- W.number(dh, 2)
+        lev : U32 <- W.number(dh, 3)
+        W.check(Bool.not(optional) || U32.is_eq(lev, 3), "only RLE definition levels are supported")
+        W.check(U32.is_le(n, left), "page count exceeds column count")
+        data : W.Bytes <- decompress(codec, size, bytes)
+        +split : W.Step<Levels> <- W.step(Levels, v1_levels(optional, n, data))
+        return Payload{n, enc, W.parsed(Levels, split), W.rest(Levels, split)}
+    case 3:
+      do W.R<Payload>:
+        v : W.Value <- W.get(h, 8)
+        +dh : List<&2, W.Field> <- W.as_fields(v)
+        +n : U32 <- W.number(dh, 1)
+        +nulls : U32 <- W.number(dh, 2)
+        rows : U32 <- W.number(dh, 3)
+        enc : U32 <- W.number(dh, 4)
+        +defs : U32 <- W.number(dh, 5)
+        reps : U32 <- W.number(dh, 6)
+        compressed : Bool <- compressed_flag(W.lookup(dh, 7))
+        W.check(U32.is_eq(rows, n) && U32.is_le(n, left) && U32.is_le(nulls, n), "invalid flat Data Page V2 counts")
+        W.check(U32.is_zero(reps) && U32.is_le(defs, size), "invalid flat Data Page V2 level lengths")
+        +split : W.Step<Levels> <- W.step(Levels, levels(optional, n, defs, bytes))
+        +defined : Levels = W.parsed(Levels, split)
+        W.check(U32.is_eq((n - nulls : U32), present_count(defined)), "Data Page V2 null count differs from definition levels")
+        # Only the values section can be compressed in V2. Writers may leave it
+        # uncompressed even when the column chunk specifies a compression codec.
+        data : W.Bytes <- decompress(Bool.pick(U32, compressed, codec, 0), (size - defs : U32), W.rest(Levels, split))
+        return Payload{n, enc, defined, data}
+    case _: W.fail(Payload, "unsupported data page type")
+
+def dictionary(page: Page, leaf: Leaf, codec: U32) -> W.R(Dictionary):
+  Page{+h, size, stored} = page
   Leaf{_, p, tag, _, _} = leaf
   do W.R<Dictionary>:
     header_type : U32 <- W.number(h, 1)
     W.check(U32.is_eq(header_type, 2), "dictionary offset does not identify a dictionary page")
+    bytes : W.Bytes <- decompress(codec, size, stored)
     header : W.Value <- W.get(h, 7)
     +fs : List<&2, W.Field> <- W.as_fields(header)
     n : U32 <- W.number(fs, 1)
@@ -356,39 +403,58 @@ def dictionary(page: Page, leaf: Leaf) -> W.R(Dictionary):
         return List.reverse(&2, T.Cell, acc)
     case input:
       do W.R<List<&2, T.Cell>>:
-        +step : W.Step<Page> <- W.step(Page, page(codec, input))
+        +step : W.Step<Page> <- W.step(Page, page(input))
         data_page(W.parsed(Page, step), W.rest(Page, step), codec, leaf, dict, left, acc)
 
-@unsafe def data_page(part: Page, next: W.Bytes, codec: U32, +leaf: Leaf, +dict: Dictionary, +left: U32, acc: List<&2, T.Cell>) -> W.R(List<&2, T.Cell>):
-  Page{+fs, data} = part
-  Leaf{_, _, _, _, optional} = leaf
+@unsafe def data_page(part: Page, next: W.Bytes, +codec: U32, +leaf: Leaf, +dict: Dictionary, +left: U32, acc: List<&2, T.Cell>) -> W.R(List<&2, T.Cell>):
+  Page{+fs, size, bytes} = part
+  Leaf{_, p, annotation, _, optional} = leaf
   do W.R<List<&2, T.Cell>>:
     tag : U32 <- W.number(fs, 1)
-    W.check(U32.is_zero(tag), "only Data Page V1 is supported")
-    +info : DataInfo <- data_header(fs, left, optional)
-    updated : List<&2, T.Cell> <- read_data(info, leaf, dict, data, acc)
-    pages(next, codec, leaf, dict, (left - data_count(info) : U32), updated)
+    body : Payload <- payload(tag, fs, left, optional, codec, size, bytes)
+    data_values(body, p, annotation, next, codec, leaf, dict, left, acc)
 
-def read_chunk(has_dict: Bool, +start: U32, +data_start: U32, +size: U32, body: W.Bytes, +codec: U32, +leaf: Leaf, +n: U32) -> W.R(List<&2, T.Cell>):
+@unsafe def data_values(body: Payload, p: U32, tag: U32, next: W.Bytes, codec: U32, leaf: Leaf, +dict: Dictionary, left: U32, acc: List<&2, T.Cell>) -> W.R(List<&2, T.Cell>):
+  Payload{n, enc, +defined, data} = body
+  do W.R<List<&2, T.Cell>>:
+    cells : List<&2, T.Cell> <- page_values(enc, present_count(defined), p, tag, dict, data)
+    updated : List<&2, T.Cell> <- add_values(defined, cells, acc)
+    pages(next, codec, leaf, dict, (left - n : U32), updated)
+
+def offset_bytes(found: Maybe<&2, W.Bytes>) -> W.R(W.Bytes):
+  match found:
+    case Some{bs}: Done{bs}
+    case None{}: W.fail(W.Bytes, "offset outside the file")
+
+type Body is Data:
+  Body{file: B.Index, length: U32}
+
+def chunk_bytes(body: Body, +offset: U32, +size: U32) -> W.R(W.Bytes):
+  Body{file, +length} = body
+  do W.R<W.Bytes>:
+    W.check(U32.is_le(offset, length) && U32.is_le(size, (length - offset : U32)), "chunk outside the data section")
+    start : W.Bytes <- offset_bytes(B.suffix(file, offset))
+    span : W.Bytes & W.Bytes <- W.take(size, start)
+    return Pair.snd(W.Bytes, W.Bytes, span)
+
+def read_chunk(has_dict: Bool, +start: U32, +data_start: U32, +size: U32, body: Body, +codec: U32, +leaf: Leaf, +n: U32) -> W.R(List<&2, T.Cell>):
   match has_dict:
     case False{}:
       do W.R<List<&2, T.Cell>>:
         W.check(U32.is_ge(start, 4) || (U32.is_zero(start) && U32.is_zero(size)), "invalid data page offset")
-        bs : W.Bytes <- W.skip((U32.max(start, 4) - 4 : U32), body)
-        chunk : W.Bytes & W.Bytes <- W.take(size, bs)
-        pages(Pair.snd(W.Bytes, W.Bytes, chunk), codec, leaf, NoDict{}, n, Nil{})
+        chunk : W.Bytes <- chunk_bytes(body, (U32.max(start, 4) - 4 : U32), size)
+        pages(chunk, codec, leaf, NoDict{}, n, Nil{})
     case True{}:
       do W.R<List<&2, T.Cell>>:
         # A zero-row chunk can consist solely of an empty dictionary page.
         +dict_only : Bool = U32.is_zero(n) && U32.is_zero(data_start)
         +dict_size : U32 = Bool.pick(U32, dict_only, size, (data_start - start : U32))
         W.check(U32.is_ge(start, 4) && (dict_only || U32.is_ge(data_start, start)) && U32.is_le(dict_size, size), "invalid dictionary/data offsets")
-        bs : W.Bytes <- W.skip((start - 4 : U32), body)
-        chunk : W.Bytes & W.Bytes <- W.take(size, bs)
-        +split : W.Step<W.Bytes> <- W.step(W.Bytes, W.take(dict_size, Pair.snd(W.Bytes, W.Bytes, chunk)))
-        segment : W.Bytes & Page <- page(codec, W.parsed(W.Bytes, split))
+        chunk : W.Bytes <- chunk_bytes(body, (start - 4 : U32), size)
+        +split : W.Step<W.Bytes> <- W.step(W.Bytes, W.take(dict_size, chunk))
+        segment : W.Bytes & Page <- page(W.parsed(W.Bytes, split))
         dp : Page <- complete(Page, segment)
-        dict : Dictionary <- dictionary(dp, leaf)
+        dict : Dictionary <- dictionary(dp, leaf, codec)
         pages(W.rest(W.Bytes, split), codec, leaf, dict, n, Nil{})
 
 def path_matches(path: List<&2, W.Value>, name: String) -> W.R(Unit):
@@ -399,7 +465,7 @@ def path_matches(path: List<&2, W.Value>, name: String) -> W.R(Unit):
         W.check(String.eq(actual, name), "column chunk path differs from its schema")
     case _: W.fail(Unit, "invalid column chunk path")
 
-def read_column(+body: W.Bytes, +leaf: Leaf, chunk: W.Value, +n: U32) -> W.R(List<&2, T.Cell>):
+def read_column(+body: Body, +leaf: Leaf, chunk: W.Value, +n: U32) -> W.R(List<&2, T.Cell>):
   Leaf{name, p, _, _, _} = leaf
   do W.R<List<&2, T.Cell>>:
     +fs : List<&2, W.Field> <- W.as_fields(chunk)
@@ -432,7 +498,7 @@ def prepend_cells(cells: List<&2, T.Cell>, rows: Rows) -> W.R(Rows):
         return (c <> row) <> tail
     case _ _: W.fail(Rows, "column lengths differ")
 
-def group_rows(leaves: List<&2, Leaf>, chunks: List<&2, W.Value>, +body: W.Bytes, +n: U32) -> W.R(Rows):
+def group_rows(leaves: List<&2, Leaf>, chunks: List<&2, W.Value>, +body: Body, +n: U32) -> W.R(Rows):
   match leaves chunks:
     case leaf <> Nil{} chunk <> Nil{}:
       do W.R<Rows>:
@@ -445,7 +511,7 @@ def group_rows(leaves: List<&2, Leaf>, chunks: List<&2, W.Value>, +body: W.Bytes
         prepend_cells(cells, rows)
     case _ _: W.fail(Rows, "row group column count differs from schema")
 
-def groups(items: List<&2, W.Value>, +leaves: List<&2, Leaf>, +body: W.Bytes, +left: U32) -> W.R(Rows):
+def groups(items: List<&2, W.Value>, +leaves: List<&2, Leaf>, +body: Body, +left: U32) -> W.R(Rows):
   match items:
     case Nil{}:
       do W.R<Rows>:
@@ -461,7 +527,7 @@ def groups(items: List<&2, W.Value>, +leaves: List<&2, Leaf>, +body: W.Bytes, +l
         others : Rows <- groups(rest, leaves, body, (left - n : U32))
         return List.append(&2, List<&2, T.Cell>, rows, others)
 
-def read_footer(metadata: W.Bytes, body: W.Bytes) -> W.R(T.Table):
+def read_footer(metadata: W.Bytes, body: Body) -> W.R(T.Table):
   do W.R<T.Table>:
     parsed : W.Bytes & W.Value <- W.fields(64, 0, Nil{}, metadata)
     root : W.Value <- complete(W.Value, parsed)
@@ -483,17 +549,16 @@ def trailer(bs: W.Bytes) -> W.R(U32):
 
 def decode(bytes: W.Bytes) -> W.R(T.Table):
   match bytes:
-    case 80 <> 65 <> 82 <> 49 <> +rest:
-      +length = W.count(U32, rest)
+    case 80 <> 65 <> 82 <> 49 <> rest:
+      +file = B.build(rest)
+      +length = B.size(file)
       do W.R<T.Table>:
         W.check(U32.is_ge(length, 8), "file is too short")
-        end : W.Bytes <- W.skip((length - 8 : U32), rest)
+        end : W.Bytes <- offset_bytes(B.suffix(file, (length - 8 : U32)))
         +size : U32 <- trailer(end)
         W.check(U32.is_le(size, (length - 8 : U32)), "footer length outside the file")
-        +section : W.Step<W.Bytes> <- W.step(W.Bytes, W.take((length - 8 - size : U32), rest))
-        foot : W.Bytes = W.rest(W.Bytes, section)
-        body : W.Bytes = W.parsed(W.Bytes, section)
+        +body_size : U32 = (length - 8 - size : U32)
+        foot : W.Bytes <- offset_bytes(B.suffix(file, body_size))
         meta : W.Bytes & W.Bytes <- W.take(size, foot)
-        bytes : W.Bytes = Pair.snd(W.Bytes, W.Bytes, meta)
-        read_footer(bytes, body)
+        read_footer(Pair.snd(W.Bytes, W.Bytes, meta), Body{file, body_size})
     case _: W.fail(T.Table, "missing PAR1 header")

@@ -11,11 +11,19 @@ def scalar(+n: U32, ascii: Bool, two: Bool, three: Bool, valid: Bool) -> Result<
     case _ _ True{} _: Done{[((n >> 12n) .|. 224 : U32), continuation((n >> 6n : U32)), continuation(n)]}
     case _ _ _ _: Done{[((n >> 18n) .|. 240 : U32), continuation((n >> 12n : U32)), continuation((n >> 6n : U32)), continuation(n)]}
 
+def is_scalar(+n: U32) -> Bool:
+  U32.is_le(n, 1114111) && (U32.is_lt(n, 55296) || U32.is_gt(n, 57343))
+
+def valid(s: String) -> Bool:
+  match s:
+    case SNil{}: True{}
+    case SCon{Chr{n}, tail}: List.all.if(_ => valid(tail), is_scalar(n))
+
 def encode(s: String) -> Result<&1, &1, (U32 & String), List<&2, U32>>:
   match s:
     case SNil{}: Done{Nil{}}
     case SCon{Chr{+n}, tail}:
-      valid = U32.is_le(n, 1114111) && (U32.is_lt(n, 55296) || U32.is_gt(n, 57343))
+      valid = is_scalar(n)
       do Result<&1, &1, (U32 & String), List<&2, U32>>:
         bytes : List<&2, U32> <- scalar(n, U32.is_lt(n, 128), U32.is_lt(n, 2048), U32.is_lt(n, 65536), valid)
         rest : List<&2, U32> <- encode(tail)

@@ -110,19 +110,23 @@ type Expr is Data:
   Field{name: String}
   Constant{literal: Literal}
   RowCount{}
+  ColumnCount{name: String}
   ColumnSum{name: String}
 
 type Item is Data:
   Item{expression: Expr, alias: Maybe<&2, String>, cast: Maybe<&2, String>}
 
-def scalar_fn(+func: String, name: String) -> L.Checked(Expr):
-  expect(Expr, String.eq(String.to_upper(func), "SUM"), ColumnSum{name}, "expected SUM(column)")
+def aggregate_fn(func: String, name: String) -> L.Checked(Expr):
+  match func:
+    case "COUNT": Done{ColumnCount{name}}
+    case "SUM": Done{ColumnSum{name}}
+    case _: L.error(Expr, "expected COUNT(column) or SUM(column)")
 
 def expression(tokens: L.Tokens) -> L.Checked(Expr):
   match tokens:
     case L.Name{f} <> L.Symbol{40} <> L.Symbol{42} <> L.Symbol{41} <> Nil{}:
       expect(Expr, String.eq(String.to_upper(f), "COUNT"), RowCount{}, "expected COUNT(*)")
-    case L.Name{f} <> L.Symbol{40} <> L.Name{name} <> L.Symbol{41} <> Nil{}: scalar_fn(f, name)
+    case L.Name{f} <> L.Symbol{40} <> L.Name{name} <> L.Symbol{41} <> Nil{}: aggregate_fn(String.to_upper(f), name)
     case L.Name{name} <> Nil{}: Done{Field{name}}
     case _:
       do L.Checked<Expr>:

@@ -11,7 +11,7 @@ def existing(r: Result<&1, &1, U32 & String, Unit>) -> IO(Unit):
 
 def total(t: T.Table) -> IO(Unit):
   match t:
-    case T.Table{_, (T.Signed{0, 2098176} <> Nil{}) <> Nil{}}: IO.print("Arrow file exchange and Parquet table creation passed")
+    case T.Table{_, (T.Signed{0, 2098176} <> Nil{}) <> Nil{}}: IO.pure(Unit, Unit{})
     case _: IO.die(Unit, 1, "wrong total")
 
 def run(args: List<String>) -> IO(Unit):
@@ -29,9 +29,13 @@ def run(args: List<String>) -> IO(Unit):
         collision : Result<&1, &1, U32 & String, Unit> <- Parquet.write(db, "select 0 as i", pq)
         existing(collision)
         IO.try(Unit, DB.exec(db, "create table scanned as select sum(i) as total from " ++ Parquet.scan(pq)))
-        result : T.Table <- IO.try(T.Table, DB.query(db, "select total from scanned"))
+        IO.try(Unit, DB.exec(db, "create temp table imported(n bigint); insert into imported select i from " ++ Parquet.scan(pq)))
+        result : T.Table <- IO.try(T.Table, DB.query(db, "select sum(n) from imported"))
+        original : T.Table <- IO.try(T.Table, DB.query(db, "select total from scanned"))
         IO.try(Unit, DB.close(db))
+        total(original)
         total(result)
+        IO.print("Arrow file exchange and Parquet table creation passed")
     case _: IO.die(Unit, 2, "provide a fresh path prefix")
 
 def main() -> IO(Unit):

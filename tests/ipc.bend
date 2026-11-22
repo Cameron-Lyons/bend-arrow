@@ -58,6 +58,49 @@ def check_stream(external: F.Bytes) -> F.R(Unit):
     check_normalized(actual, wanted)
     check_parquet(table, wanted)
 
+# PyArrow wrote two dictionaries, appended "green" with a delta, then
+# replaced both dictionaries. The score dictionary itself contains a null.
+def check_dictionaries(external: F.Bytes) -> F.R(Unit):
+  cols : List<&2, T.Column> = [T.Column{"label", "VARCHAR"}, T.Column{"score", "INTEGER"}]
+  rows : T.Rows = [[T.Utf8{"blue"}, T.Null{}], [T.Null{}, T.Signed{0, 40}], [T.Utf8{"red"}, T.Signed{0, 40}],
+    [T.Utf8{"green"}, T.Signed{0, 40}], [T.Utf8{"blue"}, T.Null{}], [T.Utf8{"new"}, T.Signed{0, 7}]]
+  do F.R<Unit>:
+    t : T.Table <- Reader.decode(external)
+    actual : F.Bytes <- Writer.encode(t)
+    expected : F.Bytes <- Writer.encode(T.Table{cols, rows})
+    F.check(equal_bytes(actual, expected), "PyArrow dictionary values differ")
+
+def index_record(row: List<&2, T.Cell>) -> F.R(F.Bytes):
+  cols : List<&2, T.Column> = [T.Column{"label", "TINYINT"}, T.Column{"score", "USMALLINT"}]
+  do F.R<F.Bytes>:
+    batch : Writer.Batch <- Writer.columns(cols, [row])
+    return Writer.record(batch, 1)
+
+def null_dictionary_row(table: T.Table) -> Bool:
+  match table:
+    case T.Table{_, (T.Null{} <> T.Null{} <> Nil{}) <> Nil{}}: True{}
+    case _: False{}
+
+def check_keys(+external: F.Bytes) -> F.R(Unit):
+  do F.R<Unit>:
+    # A stream may carry an entirely null record before the dictionaries.
+    header : F.Bytes <- F.drop(external, 4)
+    size : U32 <- F.u32(header)
+    schema : F.Span <- F.split(external, (8 + size : U32))
+    +initial : F.Bytes = F.head(schema)
+    nulls : F.Bytes <- index_record([T.Null{}, T.Null{}])
+    t : T.Table <- Reader.decode(List.append(&2, U32, initial, nulls))
+    F.check(null_dictionary_row(t), "lost null indices preceding their dictionaries")
+    used : F.Bytes <- index_record([T.Signed{0, 0}, T.Null{}])
+    rejected(Reader.decode(List.append(&2, U32, initial, used)))
+    # Add a batch after the fixture's replacements, before its EOS marker.
+    backwards : F.Bytes <- F.drop(List.reverse(&2, U32, external), 8)
+    +prior : F.Bytes = List.reverse(&2, U32, backwards)
+    negative : F.Bytes <- index_record([T.Signed{4294967295, 4294967295}, T.Null{}])
+    rejected(Reader.decode(List.append(&2, U32, prior, negative)))
+    past_end : F.Bytes <- index_record([T.Null{}, T.Unsigned{0, 1}])
+    rejected(Reader.decode(List.append(&2, U32, prior, past_end)))
+
 def empty_rows(t: T.Table) -> Bool:
   match t:
     case T.Table{Nil{}, Nil{} <> Nil{} <> Nil{}}: True{}
@@ -79,7 +122,10 @@ def check_corrupt(+external: F.Bytes) -> F.R(Unit):
 def main() -> IO(Unit):
   do IO<Unit>:
     +bytes : F.Bytes <- IO.try(F.Bytes, FileBytes.read("tests/fixtures/pyarrow-v5.arrows"))
+    +dictionaries : F.Bytes <- IO.try(F.Bytes, FileBytes.read("tests/fixtures/pyarrow-dictionaries.arrows"))
     IO.try(Unit, IO.pure(F.R(Unit), check_stream(bytes)))
+    IO.try(Unit, IO.pure(F.R(Unit), check_dictionaries(dictionaries)))
+    IO.try(Unit, IO.pure(F.R(Unit), check_keys(dictionaries)))
     IO.try(Unit, IO.pure(F.R(Unit), check_corrupt(bytes)))
     IO.try(Unit, IO.pure(F.R(Unit), check_zero_columns()))
     IO.print("Arrow IPC interoperability passed")

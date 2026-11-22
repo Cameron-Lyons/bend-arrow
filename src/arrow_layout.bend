@@ -33,6 +33,26 @@ def kind(name: String) -> Maybe<&2, Physical>:
     case "BOOLEAN": Some{Bit{}}
     case _: None{}
 
+def integer_name(width: U32, signed: Bool) -> String:
+  match width signed:
+    case 8 True{}: "TINYINT"
+    case 8 False{}: "UTINYINT"
+    case 16 True{}: "SMALLINT"
+    case 16 False{}: "USMALLINT"
+    case 32 True{}: "INTEGER"
+    case 32 False{}: "UINTEGER"
+    case 64 True{}: "BIGINT"
+    case _ _: "UBIGINT"
+
+def sql_type(kind: Physical) -> String:
+  match kind:
+    case Integer{w, s}: integer_name(w, s)
+    case Real{32}: "FLOAT"
+    case Real{_}: "DOUBLE"
+    case Utf8Type{}: "VARCHAR"
+    case Binary{}: "BLOB"
+    case Bit{}: "BOOLEAN"
+
 def length(-A: Data, xs: List<&2, A>) -> U32:
   match xs:
     case Nil{}: 0

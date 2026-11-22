@@ -68,16 +68,56 @@ def legacy_scores(table: T.Table) -> Bool:
       legacy_rows(rows)
     case _: False{}
 
+# PyArrow 26.0.1, data_page_version=2.0, Snappy, three row groups of 12 and four rows per page.
+# The plain string values compress. The short required, dictionary ID and RLE
+# boolean pages are explicitly stored uncompressed in the same Snappy file.
+def v2_row(i: U32, row: List<&2, T.Cell>) -> Bool:
+  match i row:
+    case 0 T.Null{} <> T.Null{} <> T.Null{} <> Nil{}: True{}
+    case 2 T.Utf8{name} <> T.Boolean{False{}} <> T.Null{} <> Nil{}: String.eq(name, "blue")
+    case n T.Utf8{name} <> T.Boolean{True{}} <> T.Utf8{plain} <> Nil{}:
+      Bool.not(U32.is_even(n)) && String.eq(name, "green") && String.eq(plain, "abcdefghijklmnopqrstuvwxyz")
+    case _ _: False{}
+
+def v2_rows(rows: T.Rows, +i: U32) -> Bool:
+  match rows:
+    case Nil{}: U32.is_eq(i, 36)
+    case (T.Signed{0, id} <> row) <> rest:
+      U32.is_eq(id, i) && v2_row((i % 4 : U32), row) && v2_rows(rest, (i + 1 : U32))
+    case _: False{}
+
+def v2_table(table: T.Table) -> Bool:
+  T.Table{_, rows} = table
+  v2_rows(rows, 0)
+
+def change_byte(bs: Files.Bytes, pos: U32, value: U32) -> Files.Bytes:
+  match bs pos:
+    case _ <> rest 0: value <> rest
+    case h <> rest i: h <> change_byte(rest, (i - 1 : U32), value)
+    case Nil{} _: Nil{}
+
 def damaged(bytes: List<&2, U32>) -> List<&2, U32>:
   match bytes:
     case a <> b <> c <> d <> _ <> tail: a <> b <> c <> d <> 255 <> tail
     case _: Nil{}
+
+def test_v2() -> IO(Unit):
+  do IO<Unit>:
+    +v2 : Files.Bytes <- IO.try(Files.Bytes, Files.read("tests/fixtures/data-page-v2.parquet"))
+    table : T.Table <- IO.try(T.Table, IO.pure(Files.Outcome(T.Table), Reader.decode(v2)))
+    expect(v2_table(table), "Data Page V2 levels, compression, encoding, or row-group order changed")
+    # In the first (required) column page, offsets 14, 16 and 22 carry the
+    # zigzag-encoded num_nulls, num_rows and repetition_levels_byte_length.
+    expect(failed(T.Table, Reader.decode(change_byte(v2, 14, 2))), "an inconsistent V2 null count was accepted")
+    expect(failed(T.Table, Reader.decode(change_byte(v2, 16, 2))), "an inconsistent V2 row count was accepted")
+    expect(failed(T.Table, Reader.decode(change_byte(v2, 22, 2))), "flat V2 repetition levels were accepted")
 
 def main() -> IO(Unit):
   do IO<Unit>:
     +bytes : Files.Bytes <- IO.try(Files.Bytes, Files.read("tests/fixtures/flat-snappy.parquet"))
     table : T.Table <- IO.try(T.Table, IO.pure(Files.Outcome(T.Table), Reader.decode(bytes)))
     expect(check_rows(table), "Snappy dictionary values, validity, or row-group order changed")
+    test_v2()
     raw : Files.Bytes <- IO.try(Files.Bytes, Files.read("tests/fixtures/primitive-types.parquet"))
     typed : T.Table <- IO.try(T.Table, IO.pure(Files.Outcome(T.Table), Reader.decode(raw)))
     expect(primitive_table(typed), "numeric widths, floating-point words or packed booleans changed")

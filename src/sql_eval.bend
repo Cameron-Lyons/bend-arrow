@@ -28,6 +28,7 @@ type Bound is Data:
   At{index: Nat}
   Fixed{cell: T.Cell}
   CountRows{}
+  CountAt{index: Nat}
   SumAt{index: Nat}
 
 type Output is Data:
@@ -36,6 +37,10 @@ type Output is Data:
 def from_field(ref: ColumnRef) -> Output:
   Ref{index, name, kind} = ref
   Out{At{index}, T.Column{name, kind}}
+
+def from_count(ref: ColumnRef) -> Output:
+  Ref{index, label, _} = ref
+  Out{CountAt{index}, T.Column{"count(" ++ label ++ ")", "BIGINT"}}
 
 def from_sum(ref: ColumnRef) -> L.Checked(Output):
   Ref{index, name, +kind} = ref
@@ -49,6 +54,10 @@ def bind_expr(e: P.Expr, cols: List<&2, T.Column>) -> L.Checked(Output):
         return from_field(ref)
     case P.Constant{P.Lit{cell, kind, label}}: Done{Out{Fixed{cell}, T.Column{label, kind}}}
     case P.RowCount{}: Done{Out{CountRows{}, T.Column{"count(*)", "BIGINT"}}}
+    case P.ColumnCount{name}:
+      do L.Checked<Output>:
+        ref : ColumnRef <- find(cols, name, 0n)
+        return from_count(ref)
     case P.ColumnSum{name}:
       do L.Checked<Output>:
         ref : ColumnRef <- find(cols, name, 0n)
@@ -162,10 +171,34 @@ def sum(rows: List<&2, List<&2, T.Cell>>, +index: Nat, acc: SumState) -> L.Check
         next : SumState <- add(acc, value)
         sum(rest, index, next)
 
+def present(value: T.Cell) -> U32:
+  match value:
+    case T.Null{}: 0
+    case _: 1
+
+def counted(index: Maybe<&2, Nat>, row: List<&2, T.Cell>) -> L.Checked(U32):
+  match index:
+    case None{}: Done{1}
+    case Some{i}:
+      do L.Checked<U32>:
+        value : T.Cell <- at(row, i)
+        return present(value)
+
+def count(rows: T.Rows, +index: Maybe<&2, Nat>, hi: U32, +lo: U32) -> L.Checked(T.Cell):
+  match rows:
+    case Nil{}: Done{T.Signed{hi, lo}}
+    case row <> rest:
+      do L.Checked<T.Cell>:
+        n : U32 <- counted(index, row)
+        +next : U32 = U32.add(lo, n)
+        count(rest, index, U32.add(hi, Bool.to_u32(U32.is_lt(next, lo))), next)
+
 def aggregate(src: Bound, rows: List<&2, List<&2, T.Cell>>) -> L.Checked(T.Cell):
   match src:
     case SumAt{i}: sum(rows, i, EmptySum{})
-    case CountRows{}: Done{T.Signed{0, U32.from_nat(List.length(&2, List<&2, T.Cell>, rows))}}
+    case CountRows{}: count(rows, None{}, 0, 0)
+    case CountAt{i}: count(rows, Some{i}, 0, 0)
+    case Fixed{value}: Done{value}
     case _: L.error(T.Cell, "mixing aggregates and other projections requires GROUP BY")
 
 def aggregates(outputs: List<&2, Output>, +rows: List<&2, List<&2, T.Cell>>) -> L.Checked(List<&2, T.Cell>):
@@ -181,6 +214,7 @@ def has_aggregate(outputs: List<&2, Output>) -> Bool:
   match outputs:
     case Nil{}: False{}
     case Out{CountRows{}, _} <> _: True{}
+    case Out{CountAt{_}, _} <> _: True{}
     case Out{SumAt{_}, _} <> _: True{}
     case _ <> rest: has_aggregate(rest)
 
