@@ -67,7 +67,9 @@ void bd_arrow_on_release(struct ArrowArrayStream *stream,
 
 /* Create a new temporary table from the remaining input batches. The caller
  * retains ownership of the stream. Input must follow the Arrow C Stream ABI
- * and describe a record batch (a struct of named fields). */
+ * and describe a record batch (a struct of named fields). A LIST or LARGE_LIST
+ * column with dictionary-encoded elements may return EINVAL if DuckDB would
+ * read the wrong null bitmap window. Decode its dictionary before importing. */
 int bd_arrow_import(duckdb_connection con, const char *table_name,
                     struct ArrowArrayStream *input, char **error);
 

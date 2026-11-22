@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Install the matching C header and shared library into the project.
 set -euo pipefail
+unset CDPATH
 root=$(cd "$(dirname "$0")/.." && pwd)
 version=1.5.6
 case "$(uname -s)-$(uname -m)" in

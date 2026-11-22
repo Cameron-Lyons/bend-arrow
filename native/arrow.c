@@ -97,6 +97,10 @@ int bd_arrow_query(duckdb_connection con, const char *sql, struct ArrowArrayStre
     for (idx_t i = 0; i < q->columns; i++) {
         q->names[i] = duckdb_column_name(&q->result, i);
         q->types[i] = duckdb_column_logical_type(&q->result, i);
+        if (!q->names[i] || !q->types[i]) {
+            bd_release_query(out);
+            return bd_error(error, ENOMEM, "Reading Arrow query schema");
+        }
     }
     return 0;
 }
@@ -117,6 +121,7 @@ typedef struct {
     struct ArrowSchema *children;
     struct ArrowSchema **child_pointers;
     const char *validation_error;
+    int error_code;
 } BdScan;
 
 static void bd_borrowed_schema_release(struct ArrowSchema *schema) { schema->release = NULL; }
@@ -130,57 +135,135 @@ static int bd_scan_schema(struct ArrowArrayStream *stream, struct ArrowSchema *o
     return 0;
 }
 
-/* A sliced Arrow struct can describe its window at the root. DuckDB's
- * scan expects each top-level child to describe that window instead. Move
- * only descriptors, keeping the original arrays and release callback alive. */
-typedef struct {
-    struct ArrowArray original;
-    struct ArrowArray *columns;
-    struct ArrowArray **pointers;
-} BdSlicedBatch;
-
-static void bd_slice_release(struct ArrowArray *out) {
-    BdSlicedBatch *slice = out->private_data;
-    out->release = NULL;
-    slice->original.release(&slice->original);
-    free(slice->columns);
-    free(slice->pointers);
-    free(slice);
+/* Count only bits in the requested window. Arrow validity is LSB first and
+ * a missing bitmap denotes an all-valid array. */
+static int64_t bd_bitmap_null_count(const struct ArrowArray *array) {
+    if (!array->buffers || !array->buffers[0]) return 0;
+    const uint8_t *valid = array->buffers[0];
+    int64_t bit = array->offset, end = bit + array->length, nulls = 0;
+    while (bit < end && bit % 8) {
+        nulls += !(valid[bit / 8] & (1u << (bit % 8)));
+        bit++;
+    }
+    for (; end - bit >= 8; bit += 8)
+        nulls += 8 - __builtin_popcount(valid[bit / 8]);
+    for (; bit < end; bit++)
+        nulls += !(valid[bit / 8] & (1u << (bit % 8)));
+    return nulls;
 }
 
-static int bd_slice_batch(struct ArrowArray *out) {
-    BdSlicedBatch *slice = calloc(1, sizeof(*slice));
-    if (!slice) return ENOMEM;
-    size_t count = (size_t)out->n_children;
-    slice->columns = calloc(count, sizeof(*slice->columns));
-    slice->pointers = calloc(count, sizeof(*slice->pointers));
-    if (!slice->columns || !slice->pointers) {
-        free(slice->columns);
-        free(slice->pointers);
-        free(slice);
-        return ENOMEM;
+/* DuckDB expects the root window on each top-level column, and a known
+ * null count on dictionary indices, including those nested in other types.
+ * Most batches already have that layout. Count descriptors while checking
+ * for adaptations so a batch needing a view can allocate them together. */
+static int bd_inspect_array(const struct ArrowArray *array, size_t *count, int *needs_view) {
+    if (!array || !array->release || array->offset < 0 || array->length < 0 ||
+        array->offset > INT64_MAX - array->length || array->n_children < 0 ||
+        (array->n_children && !array->children)) return EINVAL;
+    if (*count == SIZE_MAX) return ENOMEM;
+    ++*count;
+    for (int64_t i = 0; i < array->n_children; i++) {
+        int rc = bd_inspect_array(array->children[i], count, needs_view);
+        if (rc) return rc;
     }
-    slice->original = *out;
-    for (size_t i = 0; i < count; i++) {
-        slice->columns[i] = *out->children[i];
-        slice->columns[i].offset += out->offset;
-        slice->columns[i].length = out->length;
-        if (slice->columns[i].null_count > 0) slice->columns[i].null_count = -1;
-        slice->pointers[i] = &slice->columns[i];
+    if (array->dictionary) {
+        if (array->null_count < 0) *needs_view = 1;
+        return bd_inspect_array(array->dictionary, count, needs_view);
     }
-    out->offset = 0;
-    out->children = slice->pointers;
-    out->release = bd_slice_release;
-    out->private_data = slice;
     return 0;
 }
 
-static int bd_has_null_rows(const struct ArrowArray *batch) {
-    if (batch->null_count >= 0) return batch->null_count != 0;
-    if (!batch->buffers || !batch->buffers[0]) return 0;
-    const uint8_t *valid = batch->buffers[0];
-    for (int64_t i = batch->offset; i < batch->offset + batch->length; i++) {
-        if (!(valid[i / 8] & (1u << (i % 8)))) return 1;
+typedef struct {
+    struct ArrowArray original;
+    struct ArrowArray **pointers;
+    struct ArrowArray arrays[];
+} BdBatchView;
+
+static void bd_view_release(struct ArrowArray *out) {
+    BdBatchView *view = out->private_data;
+    out->release = NULL;
+    view->original.release(&view->original);
+    free(view->pointers);
+    free(view);
+}
+
+typedef struct {
+    struct ArrowArray *arrays;
+    struct ArrowArray **pointers;
+} BdViewCursor;
+
+static struct ArrowArray *bd_copy_column(BdViewCursor *cursor, const struct ArrowArray *source,
+                                         int64_t skip, int64_t length) {
+    struct ArrowArray *column = cursor->arrays++;
+    *column = *source;
+    column->offset += skip;
+    column->length = length;
+    if (length != source->length && column->null_count > 0) column->null_count = -1;
+    if (source->n_children) {
+        column->children = cursor->pointers;
+        cursor->pointers += source->n_children;
+        for (int64_t i = 0; i < source->n_children; i++) {
+            const struct ArrowArray *child = source->children[i];
+            column->children[i] = bd_copy_column(cursor, child, 0, child->length);
+        }
+    }
+    if (source->dictionary) {
+        if (column->null_count < 0) column->null_count = bd_bitmap_null_count(column);
+        column->dictionary = bd_copy_column(cursor, source->dictionary, 0, source->dictionary->length);
+    }
+    return column;
+}
+
+static int bd_make_batch_view(struct ArrowArray *out, size_t count) {
+    if (count > (SIZE_MAX - sizeof(BdBatchView)) / sizeof(struct ArrowArray)) return ENOMEM;
+    BdBatchView *view = malloc(sizeof(*view) + count * sizeof(*view->arrays));
+    if (!view) return ENOMEM;
+    view->pointers = malloc(count * sizeof(*view->pointers));
+    if (!view->pointers) {
+        free(view);
+        return ENOMEM;
+    }
+    view->original = *out;
+    BdViewCursor cursor = {view->arrays, view->pointers + out->n_children};
+    for (int64_t i = 0; i < out->n_children; i++)
+        view->pointers[i] = bd_copy_column(&cursor, out->children[i], out->offset, out->length);
+    out->offset = 0;
+    out->null_count = 0;
+    out->children = view->pointers;
+    out->release = bd_view_release;
+    out->private_data = view;
+    return 0;
+}
+
+/* In DuckDB 1.5.6 the LIST dictionary decoder reads indices at the first
+ * list offset but validity at the current row offset. Check just these
+ * windows before handing over a nullable dictionary. */
+static int bd_list_dictionary_mismatch(const struct ArrowSchema *schema,
+                                       const struct ArrowArray *list) {
+    int64_t rows = list->length;
+    if (!rows || !list->n_children) return 0;
+    const struct ArrowArray *indices = list->children[0];
+    if (!indices->dictionary || !indices->null_count || !indices->buffers || !indices->buffers[0]) return 0;
+    int large = !strcmp(schema->format, "+L");
+    if (!large && strcmp(schema->format, "+l")) return 0;
+    const uint8_t *valid = indices->buffers[0];
+    if (list->n_buffers < 2 || !list->buffers || !list->buffers[1]) return 1;
+    const void *offsets = list->buffers[1];
+    int64_t vector_size = (int64_t)duckdb_vector_size();
+    for (int64_t row = 0; row < rows;) {
+        int64_t n = rows - row < vector_size ? rows - row : vector_size;
+        int64_t i = list->offset + row;
+        int64_t first = large ? ((const int64_t *)offsets)[i] : ((const int32_t *)offsets)[i];
+        int64_t last = large ? ((const int64_t *)offsets)[i + n] : ((const int32_t *)offsets)[i + n];
+        if (first < 0 || last < first || last > indices->length) return 1;
+        if (first != row && last > first) {
+            if (last - first > indices->length - row) return 1;
+            for (int64_t j = 0; j < last - first; j++) {
+                int64_t a = indices->offset + first + j, b = indices->offset + row + j;
+                if (((valid[a / 8] >> (a % 8)) ^ (valid[b / 8] >> (b % 8))) & 1) return 1;
+            }
+        }
+        row += n;
     }
     return 0;
 }
@@ -191,31 +274,42 @@ static int bd_scan_next(struct ArrowArrayStream *stream, struct ArrowArray *out)
     int rc = scan->input->get_next(scan->input, out);
     if (rc) {
         *out = (struct ArrowArray){0};
+        scan->error_code = rc;
         return rc;
     }
     if (!out->release) return 0;
-    int sliced = out->offset != 0;
+    int needs_view = out->offset != 0;
+    size_t count = 0;
     if (out->length < 0 || out->offset < 0 || out->offset > INT64_MAX - out->length ||
         !out->children || out->n_children != scan->schema.n_children) {
         scan->validation_error = "Invalid Arrow record batch";
-    } else if (bd_has_null_rows(out)) {
+    } else if (out->null_count > 0 || (out->null_count < 0 && bd_bitmap_null_count(out))) {
         scan->validation_error = "Arrow record batch contains null rows";
     } else {
         for (int64_t i = 0; i < out->n_children; i++) {
             struct ArrowArray *child = out->children[i];
-            if (!child || !child->release || child->offset < 0 || child->length < out->length + out->offset ||
-                child->offset > INT64_MAX - child->length) {
+            rc = bd_inspect_array(child, &count, &needs_view);
+            if (rc || child->length < out->length + out->offset) {
                 scan->validation_error = "Invalid Arrow record batch child";
                 break;
             }
-            if (child->length != out->length) sliced = 1;
+            if (child->length != out->length) needs_view = 1;
         }
     }
-    if (!scan->validation_error && sliced && (rc = bd_slice_batch(out)))
-        scan->validation_error = "Allocating sliced Arrow batch descriptors";
+    if (!scan->validation_error && needs_view && (rc = bd_make_batch_view(out, count)))
+        scan->validation_error = "Allocating Arrow batch descriptors";
+    if (!scan->validation_error) {
+        for (int64_t i = 0; i < out->n_children; i++) {
+            if (bd_list_dictionary_mismatch(scan->schema.children[i], out->children[i])) {
+                scan->validation_error = "DuckDB cannot preserve this list's dictionary nulls. Decode the dictionary before import.";
+                break;
+            }
+        }
+    }
     if (scan->validation_error) {
         out->release(out);
-        return rc ? rc : EINVAL;
+        scan->error_code = rc ? rc : EINVAL;
+        return scan->error_code;
     }
     return 0;
 }
@@ -361,6 +455,7 @@ int bd_arrow_import(duckdb_connection con, const char *table_name, struct ArrowA
     if (!rc && duckdb_arrow_scan(source, "bd_input", (duckdb_arrow_stream)&borrowed))
         rc = bd_error(error, EINVAL, "DuckDB cannot scan the supplied Arrow schema");
     if (!rc) rc = bd_copy_scan(source, con, table_name, error);
+    if (rc && scan.error_code) rc = scan.error_code;
     duckdb_disconnect(&source);
     duckdb_close(&db);
     free(scan.child_pointers);

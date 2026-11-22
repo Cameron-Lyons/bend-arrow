@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+unset CDPATH
 if (( $# < 2 )); then
   echo "Usage: scripts/build INPUT.bend OUTPUT [extra compiler or linker arguments ...]" >&2
   exit 2
@@ -22,5 +23,5 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 "${BEND:-bend}" "$input" -o "$stage/program.c"
 "${CC:-clang}" -O2 -pthread -I"$root/native" -I"$duckdb_dir" \
-  "$stage/program.c" "$@" -L"$bridge_dir" -Wl,-rpath,"$bridge_dir" -lbendarrow \
-  -L"$duckdb_dir" -Wl,-rpath,"$duckdb_dir" -lduckdb -lm -o "$output"
+  "$stage/program.c" "$@" -L"$bridge_dir" -Xlinker -rpath -Xlinker "$bridge_dir" -lbendarrow \
+  -L"$duckdb_dir" -Xlinker -rpath -Xlinker "$duckdb_dir" -lduckdb -lm -o "$output"
